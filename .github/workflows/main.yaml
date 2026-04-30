@@ -1,65 +1,56 @@
 name: ESP-IDF Build and Release
 
+permissions:
+  contents: write
+
 on:
   push:
-    branches: [ "main" ]
     tags:
-      - 'v*' # Triggers the release flow when you push a tag like v1.0
+      - 'v*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: espressif/idf:v5.1 # Ensure this matches your version
-    
+    container: espressif/idf:v5.1
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
-      - name: Build with idf.py
+      - name: Build
         run: |
           . $IDF_PATH/export.sh
           idf.py build
-          
-      # Optional: Merge binaries into one file for easier flashing
-      - name: Merge Binaries
-        run: |
-          . $IDF_PATH/export.sh
-          # We move into the build directory first so the paths are correct
           cd build
-          esptool.py --chip esp32 merge_bin \
-            -o full_firmware.bin \
-            --flash_mode dio \
-            --flash_freq 40m \
-            --flash_size 2MB \
-            0x1000 bootloader/bootloader.bin \
-            0x8000 partition_table/partition-table.bin \
-            0x10000 Website_test.bin
+          esptool.py --chip esp32 merge_bin -o full_firmware.bin @flash_args
 
-      - name: Upload Artifacts (Internal)
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-binaries
-          path: build/*.bin
+          name: esp32-bins
+          path: |
+            build/full_firmware.bin
+            build/partition_table/partition-table.bin
+            build/bootloader/bootloader.bin
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/') # Only run this job if it's a tag
     runs-on: ubuntu-latest
     steps:
-      - name: Download Build Artifacts
+      - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: firmware-binaries
+          name: esp32-bins
+          path: ./release_assets  # Force them into a specific folder
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Use the path to the folder we just created
           files: |
-            full_firmware.bin
-            partition-table.bin
-            bootloader.bin
-          body: "Automated build for version ${{ github.ref_name }}"
+            release_assets/full_firmware.bin
+            release_assets/partition-table.bin
+            release_assets/bootloader.bin
+          body: "Automated firmware build for ${{ github.ref_name }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
