@@ -1,17 +1,16 @@
-name: ESP-IDF Build
+name: ESP-IDF Build and Release
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    tags:
+      - 'v*' # Triggers the release flow when you push a tag like v1.0
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # This uses the official Espressif image (change v5.1 to your version)
-    container: espressif/idf:v5.1
-
+    container: espressif/idf:v5.1 # Ensure this matches your version
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,12 +21,36 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
           idf.py build
+          
+      # Optional: Merge binaries into one file for easier flashing
+      - name: Merge Binaries
+        run: |
+          . $IDF_PATH/export.sh
+          esptool.py --chip esp32 merge_bin -o build/full_firmware.bin @build/flash_args
 
-      - name: Upload Binaries (Artifacts)
+      - name: Upload Artifacts (Internal)
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-firmware
-          path: |
-            build/*.bin
-            build/partition_table/*.bin
-            build/bootloader/*.bin
+          name: firmware-binaries
+          path: build/*.bin
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') # Only run this job if it's a tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-binaries
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            full_firmware.bin
+            partition-table.bin
+            bootloader.bin
+          body: "Automated build for version ${{ github.ref_name }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
