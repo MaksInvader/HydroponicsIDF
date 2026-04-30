@@ -1,0 +1,33 @@
+name: ESP-IDF Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # This uses the official Espressif image (change v5.1 to your version)
+    container: espressif/idf:v5.1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Build with idf.py
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build
+
+      - name: Upload Binaries (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware
+          path: |
+            build/*.bin
+            build/partition_table/*.bin
+            build/bootloader/*.bin
