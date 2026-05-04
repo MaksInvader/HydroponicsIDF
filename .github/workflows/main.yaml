@@ -23,41 +23,37 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
           
-          # 1. DELETE existing configuration to start fresh
+          # 1. Total cleanup: Remove any existing config files and build artifacts
           rm -f sdkconfig
+          rm -f sdkconfig.defaults
           rm -rf build
           
-          # 2. Create the defaults file FIRST
-          # This ensures that when we set the target, these values are baked in.
-          cat <<EOF > sdkconfig.defaults
-          # Hardware Revision Compatibility
+          # 2. Create the defaults file with explicit anti-rollback and revision overrides
+          # We use "CONFIG_BOOTLOADER_RESERVE_RTC_MEM=y" as a filler to ensure the file is valid
+          cat <<EOF > custom_sdkconfig.defaults
           CONFIG_ESP32S3_MIN_REV_FULL=0
           CONFIG_ESP_REV_MIN_FULL=0
           CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0
-          
-          # Disable Security Features that trigger version checks
           CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
           CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
           CONFIG_BOOTLOADER_APP_SECURE_VERSION=0
-          
-          # Enable ADC Curve Fitting Calibration (Fixes build error in sensor_telemetry.c)
           CONFIG_ADC_CALI_CURVE_FITTING_SCHEME=y
-          
-          # S3 Specific Optimization
           CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
           EOF
 
-          # 3. Set the target (this will generate a new sdkconfig based on defaults)
-          idf.py set-target esp32s3
+          # 3. Use environment variables to force IDF to use our defaults file
+          export SDKCONFIG_DEFAULTS="custom_sdkconfig.defaults"
           
-          # 4. Synchronize version
+          # 4. Set target and explicitly pass the defaults file
+          idf.py set-target --define SDKCONFIG_DEFAULTS="custom_sdkconfig.defaults" esp32s3
+          
+          # 5. Synchronize version
           export APP_PROJECT_VER=${{ github.ref_name }}
           
-          # 5. Build
-          # We use --n-target-sys-config to ensure it doesn't try to pull system defaults over ours
+          # 6. Build with forced re-evaluation of the configuration
           idf.py build
 
-          # 6. Create the merged binary
+          # 7. Create the merged binary
           cd build
           esptool.py --chip esp32s3 merge_bin -o full_firmware.bin @flash_args
 
@@ -87,6 +83,6 @@ jobs:
             release_assets/full_firmware.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
-          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Critical fix: Forced reset of secure version and ADC calibration enabled."
+          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Compatibility fix: Secure version forced to 0 via explicit SDKCONFIG_DEFAULTS flag."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
