@@ -29,7 +29,6 @@ jobs:
           rm -rf build
           
           # 2. Create the defaults file with explicit anti-rollback and revision overrides
-          # We use "CONFIG_BOOTLOADER_RESERVE_RTC_MEM=y" as a filler to ensure the file is valid
           cat <<EOF > custom_sdkconfig.defaults
           CONFIG_ESP32S3_MIN_REV_FULL=0
           CONFIG_ESP_REV_MIN_FULL=0
@@ -41,16 +40,16 @@ jobs:
           CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
           EOF
 
-          # 3. Use environment variables to force IDF to use our defaults file
+          # 3. Export the defaults file path for the IDF build system
           export SDKCONFIG_DEFAULTS="custom_sdkconfig.defaults"
           
-          # 4. Set target and explicitly pass the defaults file
-          idf.py set-target --define SDKCONFIG_DEFAULTS="custom_sdkconfig.defaults" esp32s3
+          # 4. Set target using the -D flag (correct syntax for idf.py)
+          idf.py -DSDKCONFIG_DEFAULTS="custom_sdkconfig.defaults" set-target esp32s3
           
           # 5. Synchronize version
           export APP_PROJECT_VER=${{ github.ref_name }}
           
-          # 6. Build with forced re-evaluation of the configuration
+          # 6. Build 
           idf.py build
 
           # 7. Create the merged binary
@@ -83,6 +82,6 @@ jobs:
             release_assets/full_firmware.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
-          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Compatibility fix: Secure version forced to 0 via explicit SDKCONFIG_DEFAULTS flag."
+          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Compatibility fix: Corrected idf.py syntax for SDKCONFIG_DEFAULTS."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
