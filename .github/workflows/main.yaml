@@ -7,6 +7,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch: # Allows manual triggering from the Actions tab
 
 jobs:
   build:
@@ -16,24 +17,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-          fetch-depth: 0 # Fetch all history for git describe to work if needed
+          fetch-depth: 0
 
       - name: Build
         run: |
           . $IDF_PATH/export.sh
+          
+          # Set target to ESP32-S3 explicitly
+          idf.py set-target esp32s3
+          
           # Synchronize internal firmware version with GitHub Tag
           export APP_PROJECT_VER=${{ github.ref_name }}
           
           idf.py build
           
-          # Create the single merged binary for easy flashing/OTA
+          # Create the single merged binary for ESP32-S3
           cd build
-          esptool.py --chip esp32 merge_bin -o full_firmware.bin @flash_args
+          esptool.py --chip esp32s3 merge_bin -o full_firmware.bin @flash_args
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-bins
+          name: esp32s3-bins
           path: |
             build/full_firmware.bin
             build/partition_table/partition-table.bin
@@ -46,7 +51,7 @@ jobs:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: esp32-bins
+          name: esp32s3-bins
           path: ./release_assets
 
       - name: Create GitHub Release
@@ -56,6 +61,6 @@ jobs:
             release_assets/full_firmware.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
-          body: "Automated firmware build for version ${{ github.ref_name }}. The internal app version has been synchronized with this tag."
+          body: "Automated firmware build for ESP32-S3 version ${{ github.ref_name }}."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
