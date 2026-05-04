@@ -29,10 +29,13 @@ jobs:
           # Synchronize internal firmware version with GitHub Tag
           export APP_PROJECT_VER=${{ github.ref_name }}
           
-          # Build with a fix for the eFuse revision mismatch error (ESP_ERR_OTA_VALIDATE_FAILED)
-          # We explicitly set the minimum chip revision to 0 to support all S3 chips.
-          idf.py build -DCONFIG_ESP32S3_MIN_REV_FULL=0
-          
+          # Forcefully override eFuse/Chip revision requirements to support v1.3 chips
+          # We use -D flags to ensure these settings are applied during the build process.
+          idf.py build \
+            -DCONFIG_ESP32S3_MIN_REV_FULL=0 \
+            -DCONFIG_ESP_REV_MIN_FULL=0 \
+            -DCONFIG_ESP_ROM_HAS_ESD_ADDR_FIX=n
+
           # Create the single merged binary for ESP32-S3
           cd build
           esptool.py --chip esp32s3 merge_bin -o full_firmware.bin @flash_args
