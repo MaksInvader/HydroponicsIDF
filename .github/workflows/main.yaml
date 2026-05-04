@@ -29,12 +29,14 @@ jobs:
           # Synchronize internal firmware version with GitHub Tag
           export APP_PROJECT_VER=${{ github.ref_name }}
           
-          # Forcefully override eFuse/Chip revision requirements to support v1.3 chips
-          # We use -D flags to ensure these settings are applied during the build process.
-          idf.py build \
-            -DCONFIG_ESP32S3_MIN_REV_FULL=0 \
-            -DCONFIG_ESP_REV_MIN_FULL=0 \
-            -DCONFIG_ESP_ROM_HAS_ESD_ADDR_FIX=n
+          # FORCE RECONFIGURE: This ensures sdkconfig is overwritten with the 0 revision requirement
+          # We use idf.py reconfigure with -D to ensure the settings stick before the build starts.
+          idf.py -DCONFIG_ESP32S3_MIN_REV_FULL=0 \
+                 -DCONFIG_ESP_REV_MIN_FULL=0 \
+                 reconfigure
+
+          # Now run the build
+          idf.py build
 
           # Create the single merged binary for ESP32-S3
           cd build
