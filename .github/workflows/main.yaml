@@ -12,7 +12,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Using v5.3.2 (Stable LTS) for maximum reliability
     container: espressif/idf:v5.3.2
     steps:
       - uses: actions/checkout@v4
@@ -27,28 +26,36 @@ jobs:
           # 1. Set the target
           idf.py set-target esp32s3
           
-          # 2. Create a defaults file with nuclear compatibility settings.
-          # We set MIN to 0 and MAX to very high values to ensure 
-          # the generated binary header is accepted by any S3 hardware.
+          # 2. DELETE existing sdkconfig to prevent stale settings from the repo
+          # This is the most likely source of the "v82.33" requirement.
+          rm -f sdkconfig
+          
+          # 3. Create a defaults file that forces low-version compatibility
+          # We explicitly disable Anti-Rollback and reset the Secure Version.
           cat <<EOF > sdkconfig.defaults
+          # Hardware Revision Compatibility
           CONFIG_ESP32S3_MIN_REV_FULL=0
-          CONFIG_ESP32S3_MAX_REV_FULL=9999
           CONFIG_ESP_REV_MIN_FULL=0
-          CONFIG_ESP_REV_MAX_FULL=9999
           CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0
-          CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL=255
+          
+          # Disable Security Features that trigger version checks
+          CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
+          CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
+          CONFIG_BOOTLOADER_APP_SECURE_VERSION=0
+          
+          # S3 Specific Optimization
           CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
           EOF
 
-          # 3. Synchronize version
+          # 4. Synchronize version
           export APP_PROJECT_VER=${{ github.ref_name }}
           
-          # 4. Reconfigure using the defaults file, then build
-          # We use -D to ensure the build strictly respects the defaults file
-          idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" reconfigure
+          # 5. Reconfigure and Build
+          # We use fullclean to ensure no old artifacts interfere
+          idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" fullclean
           idf.py build
 
-          # 5. Create the merged binary
+          # 6. Create the merged binary
           cd build
           esptool.py --chip esp32s3 merge_bin -o full_firmware.bin @flash_args
 
@@ -78,6 +85,6 @@ jobs:
             release_assets/full_firmware.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
-          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Compatibility fix applied for eFuse block revision checks using max-range overrides."
+          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Secure Boot Anti-Rollback disabled for maximum hardware compatibility."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
