@@ -1,0 +1,61 @@
+name: ESP-IDF Build and Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0 # Fetch all history for git describe to work if needed
+
+      - name: Build
+        run: |
+          . $IDF_PATH/export.sh
+          # Synchronize internal firmware version with GitHub Tag
+          export APP_PROJECT_VER=${{ github.ref_name }}
+          
+          idf.py build
+          
+          # Create the single merged binary for easy flashing/OTA
+          cd build
+          esptool.py --chip esp32 merge_bin -o full_firmware.bin @flash_args
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-bins
+          path: |
+            build/full_firmware.bin
+            build/partition_table/partition-table.bin
+            build/bootloader/bootloader.bin
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32-bins
+          path: ./release_assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_assets/full_firmware.bin
+            release_assets/partition-table.bin
+            release_assets/bootloader.bin
+          body: "Automated firmware build for version ${{ github.ref_name }}. The internal app version has been synchronized with this tag."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
