@@ -23,15 +23,12 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
           
-          # 1. Set the target
-          idf.py set-target esp32s3
-          
-          # 2. DELETE existing sdkconfig to prevent stale settings from the repo
-          # This is the most likely source of the "v82.33" requirement.
+          # 1. DELETE existing configuration to start fresh
           rm -f sdkconfig
+          rm -rf build
           
-          # 3. Create a defaults file that forces low-version compatibility
-          # AND enables required ADC calibration schemes for S3.
+          # 2. Create the defaults file FIRST
+          # This ensures that when we set the target, these values are baked in.
           cat <<EOF > sdkconfig.defaults
           # Hardware Revision Compatibility
           CONFIG_ESP32S3_MIN_REV_FULL=0
@@ -50,12 +47,14 @@ jobs:
           CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
           EOF
 
+          # 3. Set the target (this will generate a new sdkconfig based on defaults)
+          idf.py set-target esp32s3
+          
           # 4. Synchronize version
           export APP_PROJECT_VER=${{ github.ref_name }}
           
-          # 5. Reconfigure and Build
-          # We use fullclean to ensure no old artifacts interfere
-          idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" fullclean
+          # 5. Build
+          # We use --n-target-sys-config to ensure it doesn't try to pull system defaults over ours
           idf.py build
 
           # 6. Create the merged binary
@@ -88,6 +87,6 @@ jobs:
             release_assets/full_firmware.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
-          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Secure Boot Anti-Rollback disabled. ADC Curve Fitting enabled."
+          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Critical fix: Forced reset of secure version and ADC calibration enabled."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
