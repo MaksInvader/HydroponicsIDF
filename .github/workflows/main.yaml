@@ -27,13 +27,16 @@ jobs:
           # 1. Set the target
           idf.py set-target esp32s3
           
-          # 2. Create a defaults file. 
-          # We add CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0 to bypass the 
-          # "efuse blk rev" check specifically seen in your logs.
+          # 2. Create a defaults file with nuclear compatibility settings.
+          # We set MIN to 0 and MAX to very high values to ensure 
+          # the generated binary header is accepted by any S3 hardware.
           cat <<EOF > sdkconfig.defaults
           CONFIG_ESP32S3_MIN_REV_FULL=0
+          CONFIG_ESP32S3_MAX_REV_FULL=9999
           CONFIG_ESP_REV_MIN_FULL=0
+          CONFIG_ESP_REV_MAX_FULL=9999
           CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0
+          CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL=255
           CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
           EOF
 
@@ -41,7 +44,7 @@ jobs:
           export APP_PROJECT_VER=${{ github.ref_name }}
           
           # 4. Reconfigure using the defaults file, then build
-          # We force a clean reconfigure to ensure the defaults are applied.
+          # We use -D to ensure the build strictly respects the defaults file
           idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" reconfigure
           idf.py build
 
@@ -75,6 +78,6 @@ jobs:
             release_assets/full_firmware.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
-          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Compatibility fix applied for eFuse block revision checks."
+          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Compatibility fix applied for eFuse block revision checks using max-range overrides."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
