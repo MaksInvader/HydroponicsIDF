@@ -760,6 +760,29 @@ static esp_err_t subscribe_formatted_topic(char *dst, size_t dst_len,
     return ESP_OK;
 }
 
+static void publish_current_version(const char *zone_id)
+{
+    if (zone_id == NULL || zone_id[0] == '\0') {
+        return;
+    }
+
+    char topic[ZONE_TOPIC_BUFFER_SIZE];
+    esp_err_t ret = write_topic(topic, sizeof(topic), "%s/version", zone_id, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to build version topic for zone %s", zone_id);
+        return;
+    }
+
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const char *version = (app_desc != NULL && app_desc->version[0] != '\0') ? app_desc->version : "unknown";
+    ret = mqtt_manager_publish(topic, version, 1, 1);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to publish version %s to %s: %s", version, topic, esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Published version %s to %s", version, topic);
+    }
+}
+
 typedef struct {
     bool *subscribed;
     const char *topic;
@@ -1005,16 +1028,12 @@ static void on_ota_trigger(const char *topic, const char *payload, int payload_l
         return;
     }
 
-    if (s_ota_latest_version[0] == '\0') {
-        ESP_LOGW(TAG, "OTA trigger received without latest version");
-        return;
-    }
-
     const esp_app_desc_t *app_desc = esp_app_get_description();
     const char *current = (app_desc != NULL && app_desc->version[0] != '\0') ? app_desc->version : "unknown";
-    if (strcmp(s_ota_latest_version, current) == 0) {
-        ESP_LOGI(TAG, "OTA already up to date: %s", current);
-        return;
+    if (s_ota_latest_version[0] != '\0') {
+        ESP_LOGI(TAG, "OTA trigger received: current=%s latest=%s", current, s_ota_latest_version);
+    } else {
+        ESP_LOGI(TAG, "OTA trigger received: current=%s latest version not published", current);
     }
 
     setup_config_t setup_cfg;
@@ -1734,6 +1753,8 @@ esp_err_t runtime_tasks_start(const char *zone_id)
         runtime_unlock();
         return ret;
     }
+
+    publish_current_version(zone_id);
 
     for (int i = 0; i < ACTUATOR_CHANNEL_COUNT; i++) {
         const char *topic = actuator_control_get_command_topic((actuator_channel_t)i);
