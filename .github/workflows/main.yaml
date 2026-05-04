@@ -31,7 +31,7 @@ jobs:
           rm -f sdkconfig
           
           # 3. Create a defaults file that forces low-version compatibility
-          # We explicitly disable Anti-Rollback and reset the Secure Version.
+          # AND enables required ADC calibration schemes for S3.
           cat <<EOF > sdkconfig.defaults
           # Hardware Revision Compatibility
           CONFIG_ESP32S3_MIN_REV_FULL=0
@@ -42,6 +42,9 @@ jobs:
           CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
           CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
           CONFIG_BOOTLOADER_APP_SECURE_VERSION=0
+          
+          # Enable ADC Curve Fitting Calibration (Fixes build error in sensor_telemetry.c)
+          CONFIG_ADC_CALI_CURVE_FITTING_SCHEME=y
           
           # S3 Specific Optimization
           CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
@@ -85,6 +88,6 @@ jobs:
             release_assets/full_firmware.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
-          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Secure Boot Anti-Rollback disabled for maximum hardware compatibility."
+          body: "ESP32-S3 Firmware ${{ github.ref_name }}. Secure Boot Anti-Rollback disabled. ADC Curve Fitting enabled."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
