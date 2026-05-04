@@ -12,7 +12,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: espressif/idf:v5.1
+    container: espressif/idf:v5.5.3
     steps:
       - uses: actions/checkout@v4
         with:
