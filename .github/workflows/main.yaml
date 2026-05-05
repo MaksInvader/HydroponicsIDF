@@ -19,22 +19,33 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 0
 
+      - name: Diagnose efuse block revision source
+        run: |
+          . $IDF_PATH/export.sh
+
+          echo "=== IDF version ==="
+          idf.py --version
+
+          echo "=== Searching IDF source for efuse block revision logic ==="
+          grep -rn "BLOCK_REV_MAX\|block_rev_max\|efuse_block_rev\|get_block_rev\|EFUSE_BLK_REV" \
+            $IDF_PATH/components/ $IDF_PATH/tools/ \
+            --include="*.py" --include="*.cmake" --include="*.c" --include="*.h" \
+            -l 2>/dev/null | head -20
+
+          echo "=== Files that set EFUSE_BLOCK_REV_MAX_FULL ==="
+          grep -rn "EFUSE_BLOCK_REV_MAX_FULL" $IDF_PATH/ 2>/dev/null | head -30
+
+          echo "=== Check host sysfs efuse values ==="
+          ls /sys/bus/platform/devices/ 2>/dev/null | grep -i efuse || echo "no efuse sysfs"
+          cat /sys/bus/platform/devices/*/nvmem 2>/dev/null | xxd | head -5 || echo "no nvmem"
+
       - name: Build
         run: |
           . $IDF_PATH/export.sh
 
-          # 1. Total cleanup
           rm -f sdkconfig
           rm -rf build
 
-          # 2. Write sdkconfig.defaults using printf (avoids YAML heredoc conflicts)
-          #
-          # KEY FIX: CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL=0
-          # The IDF uses the MAX value detected on the build host to set the minimum
-          # efuse block revision requirement embedded in the binary. On GitHub Actions
-          # runners the host reports a high efuse block revision which bleeds into the
-          # binary and causes OTA validation to fail on real hardware (v1.3 chips).
-          # Capping MAX to 0 prevents this entirely.
           printf '%s\n' \
             'CONFIG_ESP32S3_MIN_REV_FULL=0' \
             'CONFIG_ESP_REV_MIN_FULL=0' \
@@ -47,24 +58,19 @@ jobs:
             'CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y' \
             > sdkconfig.defaults
 
-          # 3. Verify the defaults file before building
-          echo "=== sdkconfig.defaults ==="
-          cat sdkconfig.defaults
-
-          # 4. Set version before set-target
           export APP_PROJECT_VER=${{ github.ref_name }}
-
-          # 5. Set target
           idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32s3
-
-          # 6. Build
           idf.py build
 
-          # 7. Verify all revision/efuse values in final sdkconfig
-          echo "=== Revision / efuse block settings in sdkconfig ==="
-          grep -E "MIN_REV|MAX_REV|ANTI_ROLLBACK|SECURE_VERSION|ROLLBACK_ENABLE|EFUSE_BLOCK_REV" sdkconfig || echo "WARNING: no matching keys found"
+          echo "=== EFUSE_BLOCK_REV values in final sdkconfig ==="
+          grep -E "EFUSE_BLOCK_REV" sdkconfig || true
 
-          # 8. Merge binary — must run from inside build/ because flash_args uses relative paths
+          echo "=== CMake cache entries for block rev ==="
+          grep -i "block_rev\|efuse" build/CMakeCache.txt || true
+
+          echo "=== Decoded app image header ==="
+          esptool.py --chip esp32s3 image_info --version 2 build/Website_Updater.bin || true
+
           cd build
           esptool.py --chip esp32s3 merge_bin \
             --flash_mode dio \
