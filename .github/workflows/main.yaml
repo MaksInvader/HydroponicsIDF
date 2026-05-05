@@ -29,7 +29,7 @@ jobs:
           rm -rf build
           
           # 2. Create the defaults file with explicit anti-rollback and revision overrides
-          cat <<EOF > custom_sdkconfig.defaults
+          cat <<EOF > sdkconfig.defaults
           CONFIG_ESP32S3_MIN_REV_FULL=0
           CONFIG_ESP_REV_MIN_FULL=0
           CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0
@@ -41,10 +41,10 @@ jobs:
           EOF
 
           # 3. Export the defaults file path for the IDF build system
-          export SDKCONFIG_DEFAULTS="custom_sdkconfig.defaults"
+          export SDKCONFIG_DEFAULTS="sdkconfig.defaults"
           
           # 4. Set target using the -D flag (correct syntax for idf.py)
-          idf.py -DSDKCONFIG_DEFAULTS="custom_sdkconfig.defaults" set-target esp32s3
+          idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32s3
           
           # 5. Synchronize version
           export APP_PROJECT_VER=${{ github.ref_name }}
