@@ -28,34 +28,32 @@ jobs:
           rm -f sdkconfig.defaults
           rm -rf build
 
-          # 2. Create sdkconfig.defaults — content must be flush-left (no indentation)
-          #    to ensure IDF parses keys correctly. Using quoted <<'EOF' to prevent
-          #    shell expansion inside the block.
-          cat <<'EOF' > sdkconfig.defaults
-CONFIG_ESP32S3_MIN_REV_FULL=0
-CONFIG_ESP_REV_MIN_FULL=0
-CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0
-CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
-CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
-CONFIG_BOOTLOADER_APP_SECURE_VERSION=0
-CONFIG_ADC_CALI_CURVE_FITTING_SCHEME=y
-CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
-EOF
+          # 2. Write sdkconfig.defaults using printf (avoids YAML heredoc conflicts)
+          printf '%s\n' \
+            'CONFIG_ESP32S3_MIN_REV_FULL=0' \
+            'CONFIG_ESP_REV_MIN_FULL=0' \
+            'CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0' \
+            'CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n' \
+            'CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n' \
+            'CONFIG_BOOTLOADER_APP_SECURE_VERSION=0' \
+            'CONFIG_ADC_CALI_CURVE_FITTING_SCHEME=y' \
+            'CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y' \
+            > sdkconfig.defaults
 
           # 3. Verify the file looks correct before building
           echo "=== sdkconfig.defaults ==="
           cat sdkconfig.defaults
 
-          # 4. Set version before set-target so it is available throughout the build
+          # 4. Set version before set-target
           export APP_PROJECT_VER=${{ github.ref_name }}
 
-          # 5. Set target — pass SDKCONFIG_DEFAULTS via -D flag only (no duplicate export)
+          # 5. Set target
           idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32s3
 
           # 6. Build
           idf.py build
 
-          # 7. Verify the revision values in the final merged sdkconfig
+          # 7. Verify revision values in final sdkconfig
           echo "=== Revision / anti-rollback settings in build/sdkconfig ==="
           grep -E "MIN_REV|ANTI_ROLLBACK|SECURE_VERSION|ROLLBACK_ENABLE" build/sdkconfig
 
@@ -93,12 +91,10 @@ EOF
             ## ESP32-S3 Firmware ${{ github.ref_name }}
 
             ### Flashing
-            Flash `full_firmware.bin` at offset `0x0`:
-            ```
+            Flash full_firmware.bin at offset 0x0:
             esptool.py --chip esp32s3 write_flash 0x0 full_firmware.bin
-            ```
 
             ### OTA
-            Serve `full_firmware.bin` from your HTTP server and point your OTA URL to it.
+            Serve full_firmware.bin from your HTTP server and point your OTA URL to it.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
