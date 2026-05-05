@@ -12,7 +12,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: espressif/idf:v5.3.2
+    # IMPORTANT: must match the IDF version used to generate your local sdkconfig.
+    # Your committed sdkconfig was generated with IDF 5.5.3 — using a mismatched
+    # version causes efuse block revision metadata incompatibilities at OTA time.
+    container: espressif/idf:v5.5.1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,9 +26,9 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
 
-          # 1. Total cleanup
+          # 1. Total cleanup — remove committed sdkconfig so it is fully regenerated
+          #    by the build system from sdkconfig.defaults only
           rm -f sdkconfig
-          rm -f sdkconfig.defaults
           rm -rf build
 
           # 2. Write sdkconfig.defaults using printf (avoids YAML heredoc conflicts)
@@ -54,8 +57,8 @@ jobs:
           idf.py build
 
           # 7. Verify revision values (sdkconfig is in project root)
-          echo "=== Revision / anti-rollback settings in sdkconfig ==="
-          grep -E "MIN_REV|ANTI_ROLLBACK|SECURE_VERSION|ROLLBACK_ENABLE" sdkconfig || echo "WARNING: no matching keys found"
+          echo "=== Revision / anti-rollback / efuse settings in sdkconfig ==="
+          grep -E "MIN_REV|ANTI_ROLLBACK|SECURE_VERSION|ROLLBACK_ENABLE|EFUSE_BLK" sdkconfig || echo "WARNING: no matching keys found"
 
           # 8. Merge binary — must run from inside build/ because flash_args uses relative paths
           cd build
