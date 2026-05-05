@@ -41,6 +41,9 @@ jobs:
           # Force 32B cache line (Higher requirements often come from 64B)
           CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
           CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
+          # Increase socket/VFS limits to avoid accept() ENFILE
+          CONFIG_LWIP_MAX_SOCKETS=16
+          CONFIG_ESP_VFS_MAX_COUNT=16
           EOF
 
           # 3. Build project
