@@ -45,6 +45,7 @@ jobs:
 
           # 3. Build project
           export APP_PROJECT_VER=${{ github.ref_name }}
+          echo "${{ github.ref_name }}" > version.txt
           idf.py set-target esp32s3
           idf.py build
 
