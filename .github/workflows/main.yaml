@@ -19,18 +19,16 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 0
 
-      - name: Build
+      - name: Build and Patch
         run: |
           . $IDF_PATH/export.sh
 
           echo "=== IDF version ==="
           idf.py --version
 
-          # 1. Total cleanup
           rm -f sdkconfig
           rm -rf build
 
-          # 2. Write sdkconfig.defaults
           printf '%s\n' \
             'CONFIG_ESP32S3_MIN_REV_FULL=0' \
             'CONFIG_ESP_REV_MIN_FULL=0' \
@@ -42,62 +40,53 @@ jobs:
             'CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y' \
             > sdkconfig.defaults
 
-          # 3. Set version, target, and build
           export APP_PROJECT_VER=${{ github.ref_name }}
           idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32s3
           idf.py build
 
-      - name: Patch eFuse block revision in app binary
-        run: |
           APP_BIN="build/Website_Updater.bin"
 
           echo "=== Image info BEFORE patch ==="
-          esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
+          python3 $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
 
-          python3 - <<'PYEOF'
-          import sys
-          sys.path.insert(0, '/opt/esp/idf/components/esptool_py/esptool')
-          try:
-              from esptool.bin_image import LoadFirmwareImage
-              img = LoadFirmwareImage('esp32s3', 'build/Website_Updater.bin')
-              print(f"Before: min_efuse_blk_rev={img.min_efuse_blk_rev}, max_efuse_blk_rev={img.max_efuse_blk_rev}")
-              img.min_efuse_blk_rev = (0, 0)
-              img.max_efuse_blk_rev = (0, 0)
-              with open('build/Website_Updater.bin', 'wb') as f:
-                  img.save(f)
-              print("Patched: min and max eFuse block revision zeroed")
-          except Exception as e:
-              print(f"esptool API patch failed: {e}")
-              print("Falling back to raw binary patch...")
-              import struct
-              with open('build/Website_Updater.bin', 'r+b') as f:
-                  data = bytearray(f.read())
-              if data[0] != 0xE9:
-                  print("ERROR: Not a valid ESP image (magic byte not found)")
-                  sys.exit(1)
-              ext_hdr_offset = 8
-              chip_id_offset = ext_hdr_offset + 5
-              chip_id = struct.unpack_from('<H', data, chip_id_offset)[0]
-              print(f"Chip ID at offset {chip_id_offset}: 0x{chip_id:04x}")
-              if chip_id == 0x0009:  # ESP32-S3
-                  efuse_min_offset = ext_hdr_offset + 16
-                  efuse_max_offset = efuse_min_offset + 2
-                  before_min = struct.unpack_from('<H', data, efuse_min_offset)[0]
-                  before_max = struct.unpack_from('<H', data, efuse_max_offset)[0]
-                  print(f"Before patch: efuse_blk_rev_min=0x{before_min:04x} ({before_min>>8}.{before_min&0xff}), efuse_blk_rev_max=0x{before_max:04x} ({before_max>>8}.{before_max&0xff})")
-                  struct.pack_into('<H', data, efuse_min_offset, 0)
-                  struct.pack_into('<H', data, efuse_max_offset, 0)
-                  print(f"After patch: efuse_blk_rev_min=0x0000, efuse_blk_rev_max=0x0000")
-                  with open('build/Website_Updater.bin', 'wb') as f:
-                      f.write(data)
-                  print("Raw binary patch applied successfully")
-              else:
-                  print(f"ERROR: Unexpected chip ID 0x{chip_id:04x}, aborting patch")
-                  sys.exit(1)
-          PYEOF
+          python3 - <<PYEOF
+import sys, struct
+
+APP_BIN = 'build/Website_Updater.bin'
+
+with open(APP_BIN, 'r+b') as f:
+    data = bytearray(f.read())
+
+if data[0] != 0xE9:
+    print("ERROR: Not a valid ESP image (bad magic byte)")
+    sys.exit(1)
+
+CHIP_ID_OFFSET   = 9
+EFUSE_MIN_OFFSET = 20
+EFUSE_MAX_OFFSET = 22
+
+chip_id = struct.unpack_from('<H', data, CHIP_ID_OFFSET)[0]
+print(f"Chip ID: 0x{chip_id:04x} (expected 0x0009 for ESP32-S3)")
+
+if chip_id != 0x0009:
+    print(f"ERROR: Unexpected chip ID 0x{chip_id:04x}")
+    sys.exit(1)
+
+before_min = struct.unpack_from('<H', data, EFUSE_MIN_OFFSET)[0]
+before_max = struct.unpack_from('<H', data, EFUSE_MAX_OFFSET)[0]
+print(f"Before: efuse_blk_rev_min={before_min>>8}.{before_min&0xff}  efuse_blk_rev_max={before_max>>8}.{before_max&0xff}")
+
+struct.pack_into('<H', data, EFUSE_MIN_OFFSET, 0)
+struct.pack_into('<H', data, EFUSE_MAX_OFFSET, 0)
+
+with open(APP_BIN, 'wb') as f:
+    f.write(data)
+
+print("Patch applied: efuse_blk_rev_min=0.0  efuse_blk_rev_max=0.0")
+PYEOF
 
           echo "=== Image info AFTER patch ==="
-          esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
+          python3 $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -129,7 +118,7 @@ jobs:
             ## ESP32-S3 Firmware ${{ github.ref_name }}
 
             ### OTA Update
-            Use **Website_Updater.bin** for OTA — serve it from your HTTP server and point your OTA URL to it.
+            Use **Website_Updater.bin** — serve it from your HTTP server and point your OTA URL to it.
 
             ### Cable Flash (first time)
             ```
