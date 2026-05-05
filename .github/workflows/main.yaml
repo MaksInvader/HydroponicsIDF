@@ -19,48 +19,53 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 0
 
-      - name: Build and Patch
+      - name: Configure and Build
         run: |
           . $IDF_PATH/export.sh
 
-          echo "=== IDF version ==="
-          idf.py --version
-
-          rm -f sdkconfig
+          # 1. Start fresh
+          rm -f sdkconfig sdkconfig.defaults
           rm -rf build
 
-          printf '%s\n' \
-            'CONFIG_ESP32S3_MIN_REV_FULL=0' \
-            'CONFIG_ESP_REV_MIN_FULL=0' \
-            'CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0' \
-            'CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n' \
-            'CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n' \
-            'CONFIG_BOOTLOADER_APP_SECURE_VERSION=0' \
-            'CONFIG_ADC_CALI_CURVE_FITTING_SCHEME=y' \
-            'CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y' \
-            > sdkconfig.defaults
+          # 2. Create the defaults file. 
+          # We use the most basic settings to ensure maximum compatibility.
+          # If you use Octal Flash/PSRAM, the IDF will force a higher revision.
+          cat <<EOF > sdkconfig.defaults
+          CONFIG_ESP_REV_MIN_FULL=0
+          CONFIG_ESP32S3_MIN_REV_FULL=0
+          CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0
+          CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
+          CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
+          CONFIG_BOOTLOADER_APP_SECURE_VERSION=0
+          # Ensure we aren't using Octal modes which trigger high rev requirements
+          CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+          CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+          EOF
 
+          # 3. Build project
           export APP_PROJECT_VER=${{ github.ref_name }}
-          idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32s3
+          idf.py set-target esp32s3
           idf.py build
 
-          APP_BIN="build/Website_Updater.bin"
-
-          echo "=== Image info BEFORE patch ==="
-          python3 $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
-
-          echo "aW1wb3J0IHN5cywgc3RydWN0CkFQUF9CSU4gPSAnYnVpbGQvV2Vic2l0ZV9VcGRhdGVyLmJpbicKd2l0aCBvcGVuKEFQUF9CSU4sICdyK2InKSBhcyBmOgogICAgZGF0YSA9IGJ5dGVhcnJheShmLnJlYWQoKSkKaWYgZGF0YVswXSAhPSAweEU5OgogICAgcHJpbnQoIkVSUk9SOiBiYWQgbWFnaWMgYnl0ZSIpCiAgICBzeXMuZXhpdCgxKQpDSElQX0lEX09GRlNFVCwgRUZVU0VfTUlOX09GRlNFVCwgRUZVU0VfTUFYX09GRlNFVCA9IDksIDIwLCAyMgpjaGlwX2lkID0gc3RydWN0LnVucGFja19mcm9tKCc8SCcsIGRhdGEsIENISVBfSURfT0ZGU0VUKVswXQpwcmludChmIkNoaXAgSUQ6IDB4e2NoaXBfaWQ6MDR4fSIpCmlmIGNoaXBfaWQgIT0gMHgwMDA5OgogICAgcHJpbnQoZiJFUlJPUjogdW5leHBlY3RlZCBjaGlwIElEIDB4e2NoaXBfaWQ6MDR4fSIpCiAgICBzeXMuZXhpdCgxKQpibWluID0gc3RydWN0LnVucGFja19mcm9tKCc8SCcsIGRhdGEsIEVGVVNFX01JTl9PRkZTRVQpWzBdCmJtYXggPSBzdHJ1Y3QudW5wYWNrX2Zyb20oJzxIJywgZGF0YSwgRUZVU0VfTUFYX09GRlNFVClbMF0KcHJpbnQoZiJCZWZvcmU6IGVmdXNlX2Jsa19yZXZfbWluPXtibWluPj44fS57Ym1pbiYweGZmfSAgZWZ1c2VfYmxrX3Jldl9tYXg9e2JtYXg+Pjh9LntibWF4JjB4ZmZ9IikKc3RydWN0LnBhY2tfaW50bygnPEgnLCBkYXRhLCBFRlVTRV9NSU5fT0ZGU0VULCAwKQpzdHJ1Y3QucGFja19pbnRvKCc8SCcsIGRhdGEsIEVGVVNFX01BWF9PRkZTRVQsIDApCndpdGggb3BlbihBUFBfQklOLCAnd2InKSBhcyBmOgogICAgZi53cml0ZShkYXRhKQpwcmludCgiUGF0Y2ggYXBwbGllZDogZWZ1c2VfYmxrX3Jldl9taW49MC4wICBlZnVzZV9ibGtfcmV2X21heD0wLjAiKQo=" | base64 -d > patch_efuse.py
-          python3 patch_efuse.py
-
-          echo "=== Image info AFTER patch ==="
-          python3 $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
+          # 4. VERIFICATION STEP
+          # This is the most important part. Look at the logs for this step!
+          echo "=== FINAL HEADER VERIFICATION ==="
+          esptool.py --chip esp32s3 image_info build/*.bin | tee image_verification.txt
+          
+          # This grep will fail the build if the revision is NOT 0.0
+          if grep -q "Min chip rev: v0.0" image_verification.txt; then
+            echo "Success: Binary is compatible with all S3 revisions (v0.0)."
+          else
+            echo "ERROR: Binary still requires high revision! Check your PSRAM/Flash settings."
+            exit 1
+          fi
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32s3-bins
           path: |
-            build/Website_Updater.bin
+            build/*.bin
             build/partition_table/partition-table.bin
             build/bootloader/bootloader.bin
 
@@ -78,18 +83,14 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release_assets/Website_Updater.bin
-            release_assets/partition-table.bin
-            release_assets/bootloader.bin
+            release_assets/*.bin
           body: |
             ## ESP32-S3 Firmware ${{ github.ref_name }}
-
-            ### OTA Update
-            Use **Website_Updater.bin** - serve it from your HTTP server and point your OTA URL to it.
-
-            ### Cable Flash (first time)
-            ```
-            esptool.py --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 4MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 Website_Updater.bin
-            ```
+            
+            ### OTA Instructions
+            Use the main application binary (the one named after your project) for OTA.
+            
+            ### Header Verification
+            This build has been verified to support **Min chip rev: v0.0**.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
