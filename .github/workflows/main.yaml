@@ -49,41 +49,8 @@ jobs:
           echo "=== Image info BEFORE patch ==="
           python3 $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
 
-          python3 - <<PYEOF
-import sys, struct
-
-APP_BIN = 'build/Website_Updater.bin'
-
-with open(APP_BIN, 'r+b') as f:
-    data = bytearray(f.read())
-
-if data[0] != 0xE9:
-    print("ERROR: Not a valid ESP image (bad magic byte)")
-    sys.exit(1)
-
-CHIP_ID_OFFSET   = 9
-EFUSE_MIN_OFFSET = 20
-EFUSE_MAX_OFFSET = 22
-
-chip_id = struct.unpack_from('<H', data, CHIP_ID_OFFSET)[0]
-print(f"Chip ID: 0x{chip_id:04x} (expected 0x0009 for ESP32-S3)")
-
-if chip_id != 0x0009:
-    print(f"ERROR: Unexpected chip ID 0x{chip_id:04x}")
-    sys.exit(1)
-
-before_min = struct.unpack_from('<H', data, EFUSE_MIN_OFFSET)[0]
-before_max = struct.unpack_from('<H', data, EFUSE_MAX_OFFSET)[0]
-print(f"Before: efuse_blk_rev_min={before_min>>8}.{before_min&0xff}  efuse_blk_rev_max={before_max>>8}.{before_max&0xff}")
-
-struct.pack_into('<H', data, EFUSE_MIN_OFFSET, 0)
-struct.pack_into('<H', data, EFUSE_MAX_OFFSET, 0)
-
-with open(APP_BIN, 'wb') as f:
-    f.write(data)
-
-print("Patch applied: efuse_blk_rev_min=0.0  efuse_blk_rev_max=0.0")
-PYEOF
+          echo "aW1wb3J0IHN5cywgc3RydWN0CkFQUF9CSU4gPSAnYnVpbGQvV2Vic2l0ZV9VcGRhdGVyLmJpbicKd2l0aCBvcGVuKEFQUF9CSU4sICdyK2InKSBhcyBmOgogICAgZGF0YSA9IGJ5dGVhcnJheShmLnJlYWQoKSkKaWYgZGF0YVswXSAhPSAweEU5OgogICAgcHJpbnQoIkVSUk9SOiBiYWQgbWFnaWMgYnl0ZSIpCiAgICBzeXMuZXhpdCgxKQpDSElQX0lEX09GRlNFVCwgRUZVU0VfTUlOX09GRlNFVCwgRUZVU0VfTUFYX09GRlNFVCA9IDksIDIwLCAyMgpjaGlwX2lkID0gc3RydWN0LnVucGFja19mcm9tKCc8SCcsIGRhdGEsIENISVBfSURfT0ZGU0VUKVswXQpwcmludChmIkNoaXAgSUQ6IDB4e2NoaXBfaWQ6MDR4fSIpCmlmIGNoaXBfaWQgIT0gMHgwMDA5OgogICAgcHJpbnQoZiJFUlJPUjogdW5leHBlY3RlZCBjaGlwIElEIDB4e2NoaXBfaWQ6MDR4fSIpCiAgICBzeXMuZXhpdCgxKQpibWluID0gc3RydWN0LnVucGFja19mcm9tKCc8SCcsIGRhdGEsIEVGVVNFX01JTl9PRkZTRVQpWzBdCmJtYXggPSBzdHJ1Y3QudW5wYWNrX2Zyb20oJzxIJywgZGF0YSwgRUZVU0VfTUFYX09GRlNFVClbMF0KcHJpbnQoZiJCZWZvcmU6IGVmdXNlX2Jsa19yZXZfbWluPXtibWluPj44fS57Ym1pbiYweGZmfSAgZWZ1c2VfYmxrX3Jldl9tYXg9e2JtYXg+Pjh9LntibWF4JjB4ZmZ9IikKc3RydWN0LnBhY2tfaW50bygnPEgnLCBkYXRhLCBFRlVTRV9NSU5fT0ZGU0VULCAwKQpzdHJ1Y3QucGFja19pbnRvKCc8SCcsIGRhdGEsIEVGVVNFX01BWF9PRkZTRVQsIDApCndpdGggb3BlbihBUFBfQklOLCAnd2InKSBhcyBmOgogICAgZi53cml0ZShkYXRhKQpwcmludCgiUGF0Y2ggYXBwbGllZDogZWZ1c2VfYmxrX3Jldl9taW49MC4wICBlZnVzZV9ibGtfcmV2X21heD0wLjAiKQo=" | base64 -d > patch_efuse.py
+          python3 patch_efuse.py
 
           echo "=== Image info AFTER patch ==="
           python3 $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
@@ -118,7 +85,7 @@ PYEOF
             ## ESP32-S3 Firmware ${{ github.ref_name }}
 
             ### OTA Update
-            Use **Website_Updater.bin** — serve it from your HTTP server and point your OTA URL to it.
+            Use **Website_Updater.bin** - serve it from your HTTP server and point your OTA URL to it.
 
             ### Cable Flash (first time)
             ```
