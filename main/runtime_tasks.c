@@ -40,6 +40,7 @@
 
 #define SENSOR_SAMPLE_INTERVAL_MS 1000
 #define COMM_INTERVAL_MS 1000
+#define VERSION_PUBLISH_INTERVAL_MS 30000
 #define DOSING_QUEUE_RECV_TIMEOUT_MS 200
 
 #define DOSING_QUEUE_LEN 16
@@ -1181,12 +1182,19 @@ static void comm_task(void *arg)
 {
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
+    TickType_t last_version_publish = last_wake;
 
     safety_wdt_register();
 
     while (!atomic_load(&s_stop_requested)) {
+        TickType_t now = xTaskGetTickCount();
         sensor_telemetry_snapshot_t snap = {0};
         bool snapshot_available = false;
+
+        if (ticks_to_ms(now - last_version_publish) >= VERSION_PUBLISH_INTERVAL_MS) {
+            publish_current_version(s_zone_id);
+            last_version_publish = now;
+        }
 
         if (sensor_telemetry_get_snapshot(&snap) == ESP_OK && snap.valid) {
             if (s_snapshot_mutex != NULL &&
