@@ -12,45 +12,29 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: espressif/idf:v5.2.3
+    container: espressif/idf:v5.3.2
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
           fetch-depth: 0
 
-      - name: Diagnose efuse block revision source
+      - name: Build
         run: |
           . $IDF_PATH/export.sh
 
           echo "=== IDF version ==="
           idf.py --version
 
-          echo "=== Searching IDF source for efuse block revision logic ==="
-          grep -rn "BLOCK_REV_MAX\|block_rev_max\|efuse_block_rev\|get_block_rev\|EFUSE_BLK_REV" \
-            $IDF_PATH/components/ $IDF_PATH/tools/ \
-            --include="*.py" --include="*.cmake" --include="*.c" --include="*.h" \
-            -l 2>/dev/null | head -20
-
-          echo "=== Files that set EFUSE_BLOCK_REV_MAX_FULL ==="
-          grep -rn "EFUSE_BLOCK_REV_MAX_FULL" $IDF_PATH/ 2>/dev/null | head -30
-
-          echo "=== Check host sysfs efuse values ==="
-          ls /sys/bus/platform/devices/ 2>/dev/null | grep -i efuse || echo "no efuse sysfs"
-          cat /sys/bus/platform/devices/*/nvmem 2>/dev/null | xxd | head -5 || echo "no nvmem"
-
-      - name: Build
-        run: |
-          . $IDF_PATH/export.sh
-
+          # 1. Total cleanup
           rm -f sdkconfig
           rm -rf build
 
+          # 2. Write sdkconfig.defaults
           printf '%s\n' \
             'CONFIG_ESP32S3_MIN_REV_FULL=0' \
             'CONFIG_ESP_REV_MIN_FULL=0' \
             'CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0' \
-            'CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL=0' \
             'CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n' \
             'CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n' \
             'CONFIG_BOOTLOADER_APP_SECURE_VERSION=0' \
@@ -58,33 +42,69 @@ jobs:
             'CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y' \
             > sdkconfig.defaults
 
+          # 3. Set version, target, and build
           export APP_PROJECT_VER=${{ github.ref_name }}
           idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32s3
           idf.py build
 
-          echo "=== EFUSE_BLOCK_REV values in final sdkconfig ==="
-          grep -E "EFUSE_BLOCK_REV" sdkconfig || true
+      - name: Patch eFuse block revision in app binary
+        run: |
+          APP_BIN="build/Website_Updater.bin"
 
-          echo "=== CMake cache entries for block rev ==="
-          grep -i "block_rev\|efuse" build/CMakeCache.txt || true
+          echo "=== Image info BEFORE patch ==="
+          esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
 
-          echo "=== Decoded app image header ==="
-          esptool.py --chip esp32s3 image_info --version 2 build/Website_Updater.bin || true
+          python3 - <<'PYEOF'
+          import sys
+          sys.path.insert(0, '/opt/esp/idf/components/esptool_py/esptool')
+          try:
+              from esptool.bin_image import LoadFirmwareImage
+              img = LoadFirmwareImage('esp32s3', 'build/Website_Updater.bin')
+              print(f"Before: min_efuse_blk_rev={img.min_efuse_blk_rev}, max_efuse_blk_rev={img.max_efuse_blk_rev}")
+              img.min_efuse_blk_rev = (0, 0)
+              img.max_efuse_blk_rev = (0, 0)
+              with open('build/Website_Updater.bin', 'wb') as f:
+                  img.save(f)
+              print("Patched: min and max eFuse block revision zeroed")
+          except Exception as e:
+              print(f"esptool API patch failed: {e}")
+              print("Falling back to raw binary patch...")
+              import struct
+              with open('build/Website_Updater.bin', 'r+b') as f:
+                  data = bytearray(f.read())
+              if data[0] != 0xE9:
+                  print("ERROR: Not a valid ESP image (magic byte not found)")
+                  sys.exit(1)
+              ext_hdr_offset = 8
+              chip_id_offset = ext_hdr_offset + 5
+              chip_id = struct.unpack_from('<H', data, chip_id_offset)[0]
+              print(f"Chip ID at offset {chip_id_offset}: 0x{chip_id:04x}")
+              if chip_id == 0x0009:  # ESP32-S3
+                  efuse_min_offset = ext_hdr_offset + 16
+                  efuse_max_offset = efuse_min_offset + 2
+                  before_min = struct.unpack_from('<H', data, efuse_min_offset)[0]
+                  before_max = struct.unpack_from('<H', data, efuse_max_offset)[0]
+                  print(f"Before patch: efuse_blk_rev_min=0x{before_min:04x} ({before_min>>8}.{before_min&0xff}), efuse_blk_rev_max=0x{before_max:04x} ({before_max>>8}.{before_max&0xff})")
+                  struct.pack_into('<H', data, efuse_min_offset, 0)
+                  struct.pack_into('<H', data, efuse_max_offset, 0)
+                  print(f"After patch: efuse_blk_rev_min=0x0000, efuse_blk_rev_max=0x0000")
+                  with open('build/Website_Updater.bin', 'wb') as f:
+                      f.write(data)
+                  print("Raw binary patch applied successfully")
+              else:
+                  print(f"ERROR: Unexpected chip ID 0x{chip_id:04x}, aborting patch")
+                  sys.exit(1)
+          PYEOF
 
-          cd build
-          esptool.py --chip esp32s3 merge_bin \
-            --flash_mode dio \
-            --flash_freq 80m \
-            --flash_size 4MB \
-            -o full_firmware.bin \
-            @flash_args
+          echo "=== Image info AFTER patch ==="
+          esptool.py --chip esp32s3 image_info --version 2 $APP_BIN || true
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32s3-bins
           path: |
-            build/full_firmware.bin
+            build/Website_Updater.bin
             build/partition_table/partition-table.bin
             build/bootloader/bootloader.bin
 
@@ -102,17 +122,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release_assets/full_firmware.bin
+            release_assets/Website_Updater.bin
             release_assets/partition-table.bin
             release_assets/bootloader.bin
           body: |
             ## ESP32-S3 Firmware ${{ github.ref_name }}
 
-            ### Flashing
-            Flash full_firmware.bin at offset 0x0:
-            esptool.py --chip esp32s3 write_flash 0x0 full_firmware.bin
+            ### OTA Update
+            Use **Website_Updater.bin** for OTA — serve it from your HTTP server and point your OTA URL to it.
 
-            ### OTA
-            Serve full_firmware.bin from your HTTP server and point your OTA URL to it.
+            ### Cable Flash (first time)
+            ```
+            esptool.py --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 4MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 Website_Updater.bin
+            ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
