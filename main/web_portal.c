@@ -572,6 +572,9 @@ esp_err_t web_portal_start(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    config.stack_size = 8192;
+
     config.server_port = 80;
     config.max_open_sockets = 7;   // ← was 10, max allowed with current LWIP_MAX_SOCKETS=10
     config.lru_purge_enable = true;
