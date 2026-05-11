@@ -10,11 +10,7 @@
 #include "freertos/task.h"
 
 #include "lcd_status.h"
-
-#define LCD_I2C_PORT       I2C_NUM_0
-#define LCD_I2C_SDA_GPIO   15
-#define LCD_I2C_SCL_GPIO   16
-#define LCD_I2C_FREQ_HZ    100000
+#include "pin_config.h"
 
 #define LCD_COLS 20
 #define LCD_ROWS 4
@@ -38,7 +34,7 @@ static esp_err_t lcd_i2c_write_byte(uint8_t data)
     i2c_master_write_byte(cmd, (uint8_t)((s_lcd_addr << 1) | I2C_MASTER_WRITE), true);
     i2c_master_write_byte(cmd, data, true);
     i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(LCD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    esp_err_t ret = i2c_master_cmd_begin(PIN_LCD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     return ret;
 }
@@ -157,17 +153,17 @@ esp_err_t lcd_status_init(void)
 
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = LCD_I2C_SDA_GPIO,
-        .scl_io_num = LCD_I2C_SCL_GPIO,
+        .sda_io_num = PIN_LCD_I2C_SDA,
+        .scl_io_num = PIN_LCD_I2C_SCL,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = LCD_I2C_FREQ_HZ,
+        .master.clk_speed = PIN_LCD_I2C_FREQ_HZ,
         .clk_flags = 0,
     };
 
-    ESP_ERROR_CHECK(i2c_param_config(LCD_I2C_PORT, &conf));
+    ESP_ERROR_CHECK(i2c_param_config(PIN_LCD_I2C_PORT, &conf));
 
-    esp_err_t ret = i2c_driver_install(LCD_I2C_PORT, conf.mode, 0, 0, 0);
+    esp_err_t ret = i2c_driver_install(PIN_LCD_I2C_PORT, conf.mode, 0, 0, 0);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(ret));
         return ret;

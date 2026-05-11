@@ -123,6 +123,51 @@ static void url_decode(char *dst, const char *src, size_t dst_len)
     dst[di] = '\0';
 }
 
+static bool json_escape_into(const char *src, char *dst, size_t dst_len)
+{
+    if (dst == NULL || dst_len == 0) {
+        return false;
+    }
+
+    if (src == NULL) {
+        dst[0] = '\0';
+        return true;
+    }
+
+    size_t di = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; p++) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') {
+            if (di + 2 >= dst_len) {
+                return false;
+            }
+            dst[di++] = '\\';
+            dst[di++] = (char)c;
+            continue;
+        }
+
+        if (c <= 0x1F) {
+            if (di + 6 >= dst_len) {
+                return false;
+            }
+            int written = snprintf(dst + di, dst_len - di, "\\u%04x", (unsigned)c);
+            if (written != 6) {
+                return false;
+            }
+            di += 6;
+            continue;
+        }
+
+        if (di + 1 >= dst_len) {
+            return false;
+        }
+        dst[di++] = (char)c;
+    }
+
+    dst[di] = '\0';
+    return true;
+}
+
 static void get_form_value(const char *body, const char *key, char *out, size_t out_len)
 {
     out[0] = '\0';
@@ -151,6 +196,176 @@ static void get_form_value(const char *body, const char *key, char *out, size_t 
     raw[raw_len] = '\0';
 
     url_decode(out, raw, out_len);
+}
+
+typedef struct {
+    char ssid[33];
+    char password[64];
+    char zone_id[33];
+    char zone_name[65];
+    char broker_ip[64];
+    int broker_port;
+} portal_request_t;
+
+typedef enum {
+    PORTAL_SETUP_OK = 0,
+    PORTAL_SETUP_WIFI_FAILED,
+    PORTAL_SETUP_MQTT_INIT_FAILED,
+    PORTAL_SETUP_MQTT_PUB_FAILED,
+    PORTAL_SETUP_RUNTIME_FAILED,
+} portal_setup_result_t;
+
+static esp_err_t send_http_error(httpd_req_t *req, const char *status, const char *message)
+{
+    httpd_resp_set_status(req, status);
+    return httpd_resp_send(req, message, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t read_request_body(httpd_req_t *req, char **out_body)
+{
+    if (out_body == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_body = NULL;
+
+    int total_len = req->content_len;
+    if (total_len <= 0 || total_len > 1536) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *body = (char *)malloc((size_t)total_len + 1);
+    if (body == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    int remaining = total_len;
+    int offset = 0;
+    while (remaining > 0) {
+        int received = httpd_req_recv(req, body + offset, remaining);
+        if (received <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        offset += received;
+        remaining -= received;
+    }
+    body[offset] = '\0';
+
+    *out_body = body;
+    return ESP_OK;
+}
+
+static esp_err_t parse_portal_request(const char *body, portal_request_t *out)
+{
+    if (body == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    char broker_port_text[8];
+    broker_port_text[0] = '\0';
+
+    get_form_value(body, "ssid=", out->ssid, sizeof(out->ssid));
+    get_form_value(body, "password=", out->password, sizeof(out->password));
+    get_form_value(body, "zone_id=", out->zone_id, sizeof(out->zone_id));
+    get_form_value(body, "zone_name=", out->zone_name, sizeof(out->zone_name));
+    get_form_value(body, "broker_ip=", out->broker_ip, sizeof(out->broker_ip));
+    get_form_value(body, "broker_port=", broker_port_text, sizeof(broker_port_text));
+
+    int broker_port = atoi(broker_port_text);
+    if (broker_port <= 0) {
+        broker_port = 1883;
+    }
+    out->broker_port = broker_port;
+
+    return ESP_OK;
+}
+
+static esp_err_t resolve_zone_assignment(const portal_request_t *req, zone_config_t *active_zone,
+                                         bool *zone_reassigned, bool *save_failed)
+{
+    if (req == NULL || active_zone == NULL || zone_reassigned == NULL || save_failed == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *save_failed = false;
+
+    zone_config_t saved_zone;
+    bool zone_found = false;
+
+    esp_err_t zone_ret = zone_config_load(&saved_zone, &zone_found);
+    if (zone_ret != ESP_OK) {
+        return zone_ret;
+    }
+
+    bool has_new_zone_id = strlen(req->zone_id) > 0;
+    bool has_new_zone_name = strlen(req->zone_name) > 0;
+
+    if (has_new_zone_id != has_new_zone_name) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (has_new_zone_id) {
+        strncpy(active_zone->zone_id, req->zone_id, sizeof(active_zone->zone_id) - 1);
+        active_zone->zone_id[sizeof(active_zone->zone_id) - 1] = '\0';
+        strncpy(active_zone->zone_name, req->zone_name, sizeof(active_zone->zone_name) - 1);
+        active_zone->zone_name[sizeof(active_zone->zone_name) - 1] = '\0';
+
+        esp_err_t save_ret = zone_config_save(active_zone);
+        if (save_ret != ESP_OK) {
+            *save_failed = true;
+            return save_ret;
+        }
+
+        *zone_reassigned = true;
+        return ESP_OK;
+    }
+
+    if (!zone_found) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    *active_zone = saved_zone;
+    *zone_reassigned = false;
+    return ESP_OK;
+}
+
+static portal_setup_result_t start_runtime_with_request(const portal_request_t *req, const zone_config_t *zone,
+                                                        const char *setup_payload)
+{
+    if (req == NULL || zone == NULL || setup_payload == NULL) {
+        return PORTAL_SETUP_RUNTIME_FAILED;
+    }
+
+    runtime_tasks_stop();
+    mqtt_manager_deinit();
+
+    esp_err_t conn_ret = wifi_manager_connect_sta(req->ssid, req->password, 20000);
+    if (conn_ret != ESP_OK) {
+        return PORTAL_SETUP_WIFI_FAILED;
+    }
+
+    lcd_status_show_wifi_and_broker(req->ssid, req->broker_ip);
+
+    esp_err_t mqtt_init_ret = mqtt_manager_init(req->broker_ip, req->broker_port);
+    if (mqtt_init_ret != ESP_OK) {
+        return PORTAL_SETUP_MQTT_INIT_FAILED;
+    }
+
+    esp_err_t mqtt_pub_ret = mqtt_manager_publish_setup_and_wait(zone->zone_id, setup_payload, 15000);
+    if (mqtt_pub_ret != ESP_OK) {
+        return PORTAL_SETUP_MQTT_PUB_FAILED;
+    }
+
+    esp_err_t runtime_ret = runtime_tasks_start(zone->zone_id);
+    if (runtime_ret != ESP_OK) {
+        return PORTAL_SETUP_RUNTIME_FAILED;
+    }
+
+    lcd_status_show_zone_overview(zone->zone_id, zone->zone_name, "None");
+    return PORTAL_SETUP_OK;
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -189,96 +404,51 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 static esp_err_t configure_post_handler(httpd_req_t *req)
 {
     char *body = NULL;
-    int total_len = req->content_len;
-    if (total_len <= 0 || total_len > 1536) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, "Invalid request body", HTTPD_RESP_USE_STRLEN);
-    }
-
-    body = (char *)malloc((size_t)total_len + 1);
-    if (body == NULL) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "Out of memory", HTTPD_RESP_USE_STRLEN);
-    }
-
-    int remaining = total_len;
-    int offset = 0;
-    while (remaining > 0) {
-        int received = httpd_req_recv(req, body + offset, remaining);
-        if (received <= 0) {
-            free(body);
-            httpd_resp_set_status(req, "400 Bad Request");
-            return httpd_resp_send(req, "Failed to read request body", HTTPD_RESP_USE_STRLEN);
-        }
-        offset += received;
-        remaining -= received;
-    }
-    body[offset] = '\0';
-
-    char ssid[33];
-    char password[64];
-    char zone_id[33];
-    char zone_name[65];
-    char broker_ip[64];
-    char broker_port_text[8];
+    portal_request_t request;
     char setup_payload[160];
-    zone_config_t saved_zone;
     zone_config_t active_zone;
     setup_config_t setup_cfg;
-    bool zone_found = false;
-    bool has_new_zone_id;
-    bool has_new_zone_name;
     bool zone_reassigned = false;
 
-    get_form_value(body, "ssid=", ssid, sizeof(ssid));
-    get_form_value(body, "password=", password, sizeof(password));
-    get_form_value(body, "zone_id=", zone_id, sizeof(zone_id));
-    get_form_value(body, "zone_name=", zone_name, sizeof(zone_name));
-    get_form_value(body, "broker_ip=", broker_ip, sizeof(broker_ip));
-    get_form_value(body, "broker_port=", broker_port_text, sizeof(broker_port_text));
-
-    if (strlen(ssid) == 0 || strlen(broker_ip) == 0) {
-        free(body);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, "ssid and broker_ip are required", HTTPD_RESP_USE_STRLEN);
+    esp_err_t body_ret = read_request_body(req, &body);
+    if (body_ret == ESP_ERR_INVALID_SIZE) {
+        return send_http_error(req, "400 Bad Request", "Invalid request body");
+    }
+    if (body_ret == ESP_ERR_NO_MEM) {
+        return send_http_error(req, "500 Internal Server Error", "Out of memory");
+    }
+    if (body_ret != ESP_OK) {
+        return send_http_error(req, "400 Bad Request", "Failed to read request body");
     }
 
-    esp_err_t zone_ret = zone_config_load(&saved_zone, &zone_found);
+    esp_err_t parse_ret = parse_portal_request(body, &request);
+    if (parse_ret != ESP_OK) {
+        free(body);
+        return send_http_error(req, "400 Bad Request", "Invalid request body");
+    }
+
+    if (strlen(request.ssid) == 0 || strlen(request.broker_ip) == 0) {
+        free(body);
+        return send_http_error(req, "400 Bad Request", "ssid and broker_ip are required");
+    }
+
+    bool save_failed = false;
+    esp_err_t zone_ret = resolve_zone_assignment(&request, &active_zone, &zone_reassigned, &save_failed);
+    if (zone_ret == ESP_ERR_INVALID_ARG) {
+        free(body);
+        return send_http_error(req, "400 Bad Request", "zone_id and zone_name must both be provided when reassigning");
+    }
+    if (zone_ret == ESP_ERR_NOT_FOUND) {
+        free(body);
+        return send_http_error(req, "400 Bad Request", "No current zone found. Provide zone_id and zone_name to assign one.");
+    }
+    if (zone_ret != ESP_OK && save_failed) {
+        free(body);
+        return send_http_error(req, "500 Internal Server Error", "Failed to save new zone assignment");
+    }
     if (zone_ret != ESP_OK) {
         free(body);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "Failed to load current zone", HTTPD_RESP_USE_STRLEN);
-    }
-
-    has_new_zone_id = strlen(zone_id) > 0;
-    has_new_zone_name = strlen(zone_name) > 0;
-
-    if (has_new_zone_id != has_new_zone_name) {
-        free(body);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, "zone_id and zone_name must both be provided when reassigning", HTTPD_RESP_USE_STRLEN);
-    }
-
-    if (has_new_zone_id) {
-        strncpy(active_zone.zone_id, zone_id, sizeof(active_zone.zone_id) - 1);
-        active_zone.zone_id[sizeof(active_zone.zone_id) - 1] = '\0';
-        strncpy(active_zone.zone_name, zone_name, sizeof(active_zone.zone_name) - 1);
-        active_zone.zone_name[sizeof(active_zone.zone_name) - 1] = '\0';
-
-        esp_err_t save_ret = zone_config_save(&active_zone);
-        if (save_ret != ESP_OK) {
-            free(body);
-            httpd_resp_set_status(req, "500 Internal Server Error");
-            return httpd_resp_send(req, "Failed to save new zone assignment", HTTPD_RESP_USE_STRLEN);
-        }
-        zone_reassigned = true;
-    } else {
-        if (!zone_found) {
-            free(body);
-            httpd_resp_set_status(req, "400 Bad Request");
-            return httpd_resp_send(req, "No current zone found. Provide zone_id and zone_name to assign one.", HTTPD_RESP_USE_STRLEN);
-        }
-        active_zone = saved_zone;
+        return send_http_error(req, "500 Internal Server Error", "Failed to load current zone");
     }
 
     int payload_written = snprintf(
@@ -290,65 +460,43 @@ static esp_err_t configure_post_handler(httpd_req_t *req)
 
     if (payload_written <= 0 || payload_written >= (int)sizeof(setup_payload)) {
         free(body);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, "Payload is too large", HTTPD_RESP_USE_STRLEN);
+        return send_http_error(req, "400 Bad Request", "Payload is too large");
     }
 
-    int broker_port = atoi(broker_port_text);
-    if (broker_port <= 0) {
-        broker_port = 1883;
-    }
+    ESP_LOGI(TAG, "Request: ssid=%s, broker=%s:%d, payload=%s",
+             request.ssid, request.broker_ip, request.broker_port, setup_payload);
 
-    ESP_LOGI(TAG, "Request: ssid=%s, broker=%s:%d, payload=%s", ssid, broker_ip, broker_port, setup_payload);
-
-    runtime_tasks_stop();
-    mqtt_manager_deinit();
-
-    esp_err_t conn_ret = wifi_manager_connect_sta(ssid, password, 20000);
-    if (conn_ret != ESP_OK) {
+    portal_setup_result_t run_ret = start_runtime_with_request(&request, &active_zone, setup_payload);
+    if (run_ret == PORTAL_SETUP_WIFI_FAILED) {
         free(body);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "Failed to connect to target Wi-Fi", HTTPD_RESP_USE_STRLEN);
+        return send_http_error(req, "500 Internal Server Error", "Failed to connect to target Wi-Fi");
     }
-
-    lcd_status_show_wifi_and_broker(ssid, broker_ip);
-
-    esp_err_t mqtt_init_ret = mqtt_manager_init(broker_ip, broker_port);
-    if (mqtt_init_ret != ESP_OK) {
+    if (run_ret == PORTAL_SETUP_MQTT_INIT_FAILED) {
         free(body);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "Connected to Wi-Fi, but failed to connect MQTT broker", HTTPD_RESP_USE_STRLEN);
+        return send_http_error(req, "500 Internal Server Error", "Connected to Wi-Fi, but failed to connect MQTT broker");
     }
-
-    esp_err_t mqtt_pub_ret = mqtt_manager_publish_setup_and_wait(active_zone.zone_id, setup_payload, 15000);
-    if (mqtt_pub_ret != ESP_OK) {
+    if (run_ret == PORTAL_SETUP_MQTT_PUB_FAILED) {
         free(body);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "MQTT SetUp publish failed or zone_id/Success timeout", HTTPD_RESP_USE_STRLEN);
+        return send_http_error(req, "500 Internal Server Error", "MQTT SetUp publish failed or zone_id/Success timeout");
     }
-
-    esp_err_t runtime_ret = runtime_tasks_start(active_zone.zone_id);
-    if (runtime_ret != ESP_OK) {
+    if (run_ret == PORTAL_SETUP_RUNTIME_FAILED) {
         free(body);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "Runtime tasks setup failed", HTTPD_RESP_USE_STRLEN);
+        return send_http_error(req, "500 Internal Server Error", "Runtime tasks setup failed");
     }
 
     memset(&setup_cfg, 0, sizeof(setup_cfg));
-    strncpy(setup_cfg.ssid, ssid, sizeof(setup_cfg.ssid) - 1);
+    strncpy(setup_cfg.ssid, request.ssid, sizeof(setup_cfg.ssid) - 1);
     setup_cfg.ssid[sizeof(setup_cfg.ssid) - 1] = '\0';
-    strncpy(setup_cfg.password, password, sizeof(setup_cfg.password) - 1);
+    strncpy(setup_cfg.password, request.password, sizeof(setup_cfg.password) - 1);
     setup_cfg.password[sizeof(setup_cfg.password) - 1] = '\0';
-    strncpy(setup_cfg.broker_ip, broker_ip, sizeof(setup_cfg.broker_ip) - 1);
+    strncpy(setup_cfg.broker_ip, request.broker_ip, sizeof(setup_cfg.broker_ip) - 1);
     setup_cfg.broker_ip[sizeof(setup_cfg.broker_ip) - 1] = '\0';
-    setup_cfg.broker_port = broker_port;
+    setup_cfg.broker_port = request.broker_port;
 
     esp_err_t save_setup_ret = setup_config_save(&setup_cfg);
     if (save_setup_ret != ESP_OK) {
         ESP_LOGW(TAG, "Runtime started, but failed to persist setup profile: %s", esp_err_to_name(save_setup_ret));
     }
-
-    lcd_status_show_zone_overview(active_zone.zone_id, active_zone.zone_name, "None");
 
     free(body);
     if (zone_reassigned) {
@@ -378,6 +526,8 @@ static esp_err_t debug_data_get_handler(httpd_req_t *req)
     const char *zone_id = "<zone_id>";
     const char *zone_name = "Not assigned";
     char zone_text[96];
+    char zone_text_escaped[600];
+    char zone_id_escaped[200];
 
     actuator_last_command_t last_cmds[ACTUATOR_CHANNEL_COUNT];
     size_t last_cmd_count = 0;
@@ -396,16 +546,32 @@ static esp_err_t debug_data_get_handler(httpd_req_t *req)
     sensor_telemetry_get_snapshot(&snap);
     commands_json[0] = '\0';
 
+    if (!json_escape_into(zone_id, zone_id_escaped, sizeof(zone_id_escaped))) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "Failed to render zone id", HTTPD_RESP_USE_STRLEN);
+    }
+
     size_t offset = 0;
     for (size_t i = 0; i < last_cmd_count; i++) {
+        char topic_escaped[600];
+        char channel_escaped[160];
+        char command_escaped[64];
+
+        if (!json_escape_into(last_cmds[i].topic, topic_escaped, sizeof(topic_escaped)) ||
+            !json_escape_into(last_cmds[i].channel, channel_escaped, sizeof(channel_escaped)) ||
+            !json_escape_into(last_cmds[i].command, command_escaped, sizeof(command_escaped))) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            return httpd_resp_send(req, "Failed to escape command list", HTTPD_RESP_USE_STRLEN);
+        }
+
         int written_cmd = snprintf(
             commands_json + offset,
             sizeof(commands_json) - offset,
             "%s{\"topic\":\"%s\",\"channel\":\"%s\",\"command\":\"%s\",\"state\":\"%s\"}",
             (i == 0) ? "" : ",",
-            last_cmds[i].topic,
-            last_cmds[i].channel,
-            last_cmds[i].command,
+            topic_escaped,
+            channel_escaped,
+            command_escaped,
             last_cmds[i].state_on ? "ON" : "OFF");
 
         if (written_cmd <= 0 || (size_t)written_cmd >= (sizeof(commands_json) - offset)) {
@@ -417,6 +583,10 @@ static esp_err_t debug_data_get_handler(httpd_req_t *req)
     }
 
     snprintf(zone_text, sizeof(zone_text), "%.32s (%.40s)", zone_id, zone_name);
+    if (!json_escape_into(zone_text, zone_text_escaped, sizeof(zone_text_escaped))) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "Failed to render zone text", HTTPD_RESP_USE_STRLEN);
+    }
 
     int written = snprintf(
         json,
@@ -454,24 +624,24 @@ static esp_err_t debug_data_get_handler(httpd_req_t *req)
         "\"subscriptionsLockTimeoutCount\":%lu"
         "}"
         "}",
-        zone_text,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
-        zone_id,
+        zone_text_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
+        zone_id_escaped,
         commands_json,
         snap.valid ? snap.water_level : 0,
         (double)(snap.valid ? snap.water_temp : 0.0f),

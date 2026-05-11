@@ -209,6 +209,10 @@ esp_err_t wifi_manager_connect_sta(const char *ssid, const char *password, int t
 
     ESP_LOGE(TAG, "Timeout while waiting for AP connection");
     s_sta_auto_reconnect_enabled = false;
+    esp_err_t disc_ret = esp_wifi_disconnect();
+    if (disc_ret != ESP_OK && disc_ret != ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_LOGW(TAG, "Disconnect after timeout failed: %s", esp_err_to_name(disc_ret));
+    }
     return ESP_ERR_TIMEOUT;
 }
 

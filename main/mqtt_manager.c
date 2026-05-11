@@ -21,6 +21,7 @@ static const char *TAG = "mqtt_manager";
 typedef struct {
     bool in_use;
     char topic[128];
+    int qos;
     mqtt_manager_message_cb_t cb;
     void *user_ctx;
 } mqtt_subscription_entry_t;
@@ -31,12 +32,19 @@ static char                     s_success_topic[96];
 static mqtt_subscription_entry_t s_subscriptions[MQTT_MAX_SUBSCRIPTIONS];
 static SemaphoreHandle_t        s_subscriptions_lock;
 static uint32_t                 s_subscriptions_lock_timeout_count;
+static mqtt_manager_connection_cb_t s_connection_cb;
+static void *s_connection_ctx;
 
 typedef struct {
     char topic[128];
     mqtt_manager_message_cb_t cb;
     void *user_ctx;
 } mqtt_dispatch_snapshot_t;
+
+typedef struct {
+    char topic[128];
+    int qos;
+} mqtt_resubscribe_entry_t;
 
 /* ── lock helpers ────────────────────────────────────────────────────────── */
 static bool subscriptions_lock_take(const char *caller)
@@ -59,6 +67,50 @@ static void subscriptions_lock_give(void)
 {
     if (s_subscriptions_lock != NULL) {
         xSemaphoreGive(s_subscriptions_lock);
+    }
+}
+
+static void mqtt_manager_resubscribe_all(void)
+{
+    if (s_client == NULL) {
+        return;
+    }
+
+    mqtt_resubscribe_entry_t snapshot[MQTT_MAX_SUBSCRIPTIONS];
+    size_t snapshot_count = 0;
+
+    if (!subscriptions_lock_take("mqtt_manager_resubscribe_all")) {
+        return;
+    }
+
+    for (int i = 0; i < MQTT_MAX_SUBSCRIPTIONS; i++) {
+        if (!s_subscriptions[i].in_use) {
+            continue;
+        }
+        if (snapshot_count >= MQTT_MAX_SUBSCRIPTIONS) {
+            break;
+        }
+        strncpy(snapshot[snapshot_count].topic, s_subscriptions[i].topic,
+                sizeof(snapshot[snapshot_count].topic) - 1);
+        snapshot[snapshot_count].topic[sizeof(snapshot[snapshot_count].topic) - 1] = '\0';
+        snapshot[snapshot_count].qos = s_subscriptions[i].qos;
+        snapshot_count++;
+    }
+
+    subscriptions_lock_give();
+
+    if (s_success_topic[0] != '\0') {
+        int sub_id = esp_mqtt_client_subscribe(s_client, s_success_topic, MQTT_DEFAULT_SUB_QOS);
+        if (sub_id < 0) {
+            ESP_LOGW(TAG, "Failed to resubscribe to success topic: %s", s_success_topic);
+        }
+    }
+
+    for (size_t i = 0; i < snapshot_count; i++) {
+        int sub_id = esp_mqtt_client_subscribe(s_client, snapshot[i].topic, snapshot[i].qos);
+        if (sub_id < 0) {
+            ESP_LOGW(TAG, "Failed to resubscribe: %s", snapshot[i].topic);
+        }
     }
 }
 
@@ -123,11 +175,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         ESP_LOGI(TAG, "MQTT connected");
         xEventGroupSetBits(s_event_group, MQTT_CONNECTED_BIT);
 
+        mqtt_manager_resubscribe_all();
+        if (s_connection_cb != NULL) {
+            s_connection_cb(true, s_connection_ctx);
+        }
+
         break;
 
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT disconnected");
         xEventGroupClearBits(s_event_group, MQTT_CONNECTED_BIT);
+        if (s_connection_cb != NULL) {
+            s_connection_cb(false, s_connection_ctx);
+        }
         break;
 
     case MQTT_EVENT_ERROR:
@@ -197,6 +257,8 @@ esp_err_t mqtt_manager_init(const char *broker_ip, int broker_port)
 
     s_subscriptions_lock_timeout_count = 0;
     s_success_topic[0]    = '\0';
+    s_connection_cb = NULL;
+    s_connection_ctx = NULL;
 
     char broker_uri[128];
     int written = snprintf(broker_uri, sizeof(broker_uri),
@@ -256,6 +318,8 @@ esp_err_t mqtt_manager_deinit(void)
     }
 
     s_success_topic[0]    = '\0';
+    s_connection_cb = NULL;
+    s_connection_ctx = NULL;
 
     if (s_event_group != NULL) {
         xEventGroupClearBits(s_event_group, MQTT_CONNECTED_BIT | MQTT_SETUP_SUCCESS_BIT);
@@ -344,6 +408,7 @@ esp_err_t mqtt_manager_subscribe(const char *topic, int qos,
             strcmp(s_subscriptions[i].topic, topic) == 0) {
             s_subscriptions[i].cb       = cb;
             s_subscriptions[i].user_ctx = user_ctx;
+            s_subscriptions[i].qos      = qos;
             subscriptions_lock_give();
             return ESP_OK;
         }
@@ -365,6 +430,7 @@ esp_err_t mqtt_manager_subscribe(const char *topic, int qos,
             strcmp(s_subscriptions[i].topic, topic) == 0) {
             s_subscriptions[i].cb       = cb;
             s_subscriptions[i].user_ctx = user_ctx;
+            s_subscriptions[i].qos      = qos;
             subscriptions_lock_give();
             return ESP_OK;
         }
@@ -384,6 +450,7 @@ esp_err_t mqtt_manager_subscribe(const char *topic, int qos,
     s_subscriptions[free_index].in_use   = true;
     s_subscriptions[free_index].cb       = cb;
     s_subscriptions[free_index].user_ctx = user_ctx;
+        s_subscriptions[free_index].qos      = qos;
     strncpy(s_subscriptions[free_index].topic, topic,
             sizeof(s_subscriptions[free_index].topic) - 1);
     s_subscriptions[free_index].topic[sizeof(s_subscriptions[free_index].topic) - 1] = '\0';
@@ -428,4 +495,11 @@ esp_err_t mqtt_manager_unsubscribe(const char *topic)
 uint32_t mqtt_manager_get_lock_timeout_count(void)
 {
     return s_subscriptions_lock_timeout_count;
+}
+
+esp_err_t mqtt_manager_set_connection_cb(mqtt_manager_connection_cb_t cb, void *user_ctx)
+{
+    s_connection_cb = cb;
+    s_connection_ctx = user_ctx;
+    return ESP_OK;
 }

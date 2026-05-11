@@ -52,6 +52,22 @@ static actuator_last_command_t s_last_command = {
     .state_on = false,
 };
 
+static void init_last_command_entry(actuator_last_command_t *entry, const actuator_entry_t *actuator,
+                                    const char *command, bool state_on)
+{
+    if (entry == NULL || actuator == NULL || command == NULL) {
+        return;
+    }
+
+    strncpy(entry->topic, actuator->command_topic, sizeof(entry->topic) - 1);
+    entry->topic[sizeof(entry->topic) - 1] = '\0';
+    strncpy(entry->channel, actuator->name, sizeof(entry->channel) - 1);
+    entry->channel[sizeof(entry->channel) - 1] = '\0';
+    strncpy(entry->command, command, sizeof(entry->command) - 1);
+    entry->command[sizeof(entry->command) - 1] = '\0';
+    entry->state_on = state_on;
+}
+
 static bool is_valid_channel(actuator_channel_t channel)
 {
     return channel >= ACTUATOR_CHANNEL_VALVE && channel <= ACTUATOR_CHANNEL_PER_PH_DOWN;
@@ -126,15 +142,10 @@ static esp_err_t init_gpios_once(void)
     return ESP_OK;
 }
 
-esp_err_t actuator_control_init(const char *zone_id)
+static esp_err_t bind_actuator_topics(const char *zone_id)
 {
-    if (zone_id == NULL || strlen(zone_id) == 0) {
+    if (zone_id == NULL || zone_id[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t ret = init_gpios_once();
-    if (ret != ESP_OK) {
-        return ret;
     }
 
     for (size_t i = 0; i < sizeof(s_actuators) / sizeof(s_actuators[0]); i++) {
@@ -158,20 +169,33 @@ esp_err_t actuator_control_init(const char *zone_id)
         }
 
         portENTER_CRITICAL(&s_state_lock);
-        strncpy(s_last_commands[i].topic, s_actuators[i].command_topic, sizeof(s_last_commands[i].topic) - 1);
-        s_last_commands[i].topic[sizeof(s_last_commands[i].topic) - 1] = '\0';
-        strncpy(s_last_commands[i].channel, s_actuators[i].name, sizeof(s_last_commands[i].channel) - 1);
-        s_last_commands[i].channel[sizeof(s_last_commands[i].channel) - 1] = '\0';
-        strncpy(s_last_commands[i].command, "OFF", sizeof(s_last_commands[i].command) - 1);
-        s_last_commands[i].command[sizeof(s_last_commands[i].command) - 1] = '\0';
-        s_last_commands[i].state_on = false;
+        init_last_command_entry(&s_last_commands[i], &s_actuators[i], "OFF", false);
         portEXIT_CRITICAL(&s_state_lock);
 
         gpio_set_level((gpio_num_t)s_actuators[i].gpio, 0);
-        ret = publish_status(&s_actuators[i], false);
+        esp_err_t ret = publish_status(&s_actuators[i], false);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Initial status publish failed for %s", s_actuators[i].name);
         }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t actuator_control_init(const char *zone_id)
+{
+    if (zone_id == NULL || strlen(zone_id) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = init_gpios_once();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = bind_actuator_topics(zone_id);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     s_topics_bound = true;

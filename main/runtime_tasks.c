@@ -101,6 +101,30 @@ typedef struct {
     bool on;
 } dosing_watchdog_t;
 
+typedef struct {
+    atomic_uint faults;
+    atomic_uint reported_faults;
+    atomic_bool safe_mode;
+    atomic_uint dosing_heartbeat;
+    atomic_uint sensor_heartbeat;
+    atomic_uint comm_heartbeat;
+    atomic_uint safety_heartbeat;
+    atomic_bool water_level_low_isr;
+    volatile TickType_t water_level_low_tick;
+    bool wdt_enabled;
+    bool ph_response_pending;
+    bool ph_response_up;
+    TickType_t ph_response_deadline;
+    float ph_response_start;
+    bool tds_response_pending;
+    TickType_t tds_response_deadline;
+    float tds_response_start;
+    safety_fault_mask_t tds_response_fault;
+    TickType_t valve_on_tick;
+    bool valve_waiting;
+    safety_fault_mask_t boot_faults;
+} runtime_safety_state_t;
+
 static const char *TAG = "runtime_tasks";
 
 static SemaphoreHandle_t s_runtime_mutex = NULL;
@@ -120,9 +144,6 @@ static bool s_running;
 static bool s_starting;
 static atomic_bool s_stop_requested;
 static volatile bool s_gate_open;
-static atomic_uint s_safety_faults;
-static atomic_uint s_reported_faults;
-static atomic_bool s_safe_mode;
 static bool s_zone_topic_subscribed;
 static bool s_channel_topics_subscribed[ACTUATOR_CHANNEL_COUNT];
 static bool s_safety_topic_subscribed;
@@ -141,25 +162,8 @@ static sensor_telemetry_snapshot_t s_last_good_snapshot;
 static bool s_last_good_snapshot_valid;
 static bool s_channel_state_on[ACTUATOR_CHANNEL_COUNT];
 static dosing_watchdog_t s_dose_watchdog[ACTUATOR_CHANNEL_COUNT];
-static atomic_uint s_dosing_heartbeat;
-static atomic_uint s_sensor_heartbeat;
-static atomic_uint s_comm_heartbeat;
-static atomic_uint s_safety_heartbeat;
-static atomic_bool s_water_level_low_isr;
-static volatile TickType_t s_water_level_low_tick;
 static bool s_isr_installed;
-static bool s_wdt_enabled;
-static bool s_ph_response_pending;
-static bool s_ph_response_up;
-static TickType_t s_ph_response_deadline;
-static float s_ph_response_start;
-static bool s_tds_response_pending;
-static TickType_t s_tds_response_deadline;
-static float s_tds_response_start;
-static safety_fault_mask_t s_tds_response_fault;
-static TickType_t s_valve_on_tick;
-static bool s_valve_waiting;
-static safety_fault_mask_t s_boot_faults;
+static runtime_safety_state_t s_safety;
 RTC_DATA_ATTR static uint32_t s_reset_count;
 RTC_DATA_ATTR static uint32_t s_wdt_reset_count;
 
@@ -249,10 +253,10 @@ static const runtime_task_slot_t s_task_slots[] = {
 };
 
 static const atomic_uint *const s_heartbeat_counters[] = {
-    &s_dosing_heartbeat,
-    &s_sensor_heartbeat,
-    &s_comm_heartbeat,
-    &s_safety_heartbeat,
+    &s_safety.dosing_heartbeat,
+    &s_safety.sensor_heartbeat,
+    &s_safety.comm_heartbeat,
+    &s_safety.safety_heartbeat,
 };
 
 static void reset_heartbeats(void)
@@ -346,7 +350,7 @@ static void safety_publish_faults(safety_fault_mask_t new_faults)
 
     if (s_safety_fault_topic[0] != '\0') {
         char payload[160];
-        safety_fault_mask_t mask = (safety_fault_mask_t)atomic_load(&s_safety_faults);
+        safety_fault_mask_t mask = (safety_fault_mask_t)atomic_load(&s_safety.faults);
         int written = snprintf(payload, sizeof(payload),
                                "{\"mask\":%lu,\"code\":\"%s\",\"count\":%d,\"text\":\"%s\"}",
                                (unsigned long)mask,
@@ -369,10 +373,30 @@ static void safety_publish_faults(safety_fault_mask_t new_faults)
     }
 }
 
+static void flush_dosing_queue(const char *reason)
+{
+    if (s_dosing_queue == NULL) {
+        return;
+    }
+
+    dosing_command_t dropped;
+    size_t dropped_count = 0;
+
+    while (xQueueReceive(s_dosing_queue, &dropped, 0) == pdTRUE) {
+        dropped_count++;
+    }
+
+    if (dropped_count > 0) {
+        ESP_LOGW(TAG, "Dropped %u dosing command(s): %s",
+                 (unsigned)dropped_count,
+                 reason != NULL ? reason : "unknown reason");
+    }
+}
+
 static void safety_enter_safe_state(safety_fault_mask_t new_faults)
 {
     (void)new_faults;
-    atomic_store(&s_safe_mode, true);
+    atomic_store(&s_safety.safe_mode, true);
 
     portENTER_CRITICAL(&s_cmd_gate_lock);
     s_gate_open = false;
@@ -383,10 +407,12 @@ static void safety_enter_safe_state(safety_fault_mask_t new_faults)
         update_channel_state_on((actuator_channel_t)i, false);
     }
 
+    flush_dosing_queue("safe mode entry");
+
     portENTER_CRITICAL(&s_safety_lock);
-    s_ph_response_pending = false;
-    s_tds_response_pending = false;
-    s_valve_waiting = false;
+    s_safety.ph_response_pending = false;
+    s_safety.tds_response_pending = false;
+    s_safety.valve_waiting = false;
     portEXIT_CRITICAL(&s_safety_lock);
 }
 
@@ -396,7 +422,7 @@ static void safety_fault_set(safety_fault_mask_t mask, const char *reason)
         return;
     }
 
-    safety_fault_mask_t prev = (safety_fault_mask_t)atomic_fetch_or(&s_safety_faults, (unsigned int)mask);
+    safety_fault_mask_t prev = (safety_fault_mask_t)atomic_fetch_or(&s_safety.faults, (unsigned int)mask);
     safety_fault_mask_t new_faults = mask & ~prev;
     if (new_faults == 0) {
         return;
@@ -408,14 +434,14 @@ static void safety_fault_set(safety_fault_mask_t mask, const char *reason)
         ESP_LOGE(TAG, "Safety fault reason: %s", reason);
     }
 
-    safety_fault_mask_t reported = (safety_fault_mask_t)atomic_fetch_or(&s_reported_faults, (unsigned int)new_faults);
+    safety_fault_mask_t reported = (safety_fault_mask_t)atomic_fetch_or(&s_safety.reported_faults, (unsigned int)new_faults);
     safety_fault_mask_t to_report = new_faults & ~reported;
     safety_publish_faults(to_report);
 }
 
 static void safety_wdt_init(void)
 {
-    if (s_wdt_enabled) {
+    if (s_safety.wdt_enabled) {
         return;
     }
 
@@ -426,7 +452,7 @@ static void safety_wdt_init(void)
     };
     esp_err_t ret = esp_task_wdt_init(&wdt_cfg);
     if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE) {
-        s_wdt_enabled = true;
+        s_safety.wdt_enabled = true;
     } else {
         ESP_LOGW(TAG, "Task WDT init failed: %s", esp_err_to_name(ret));
     }
@@ -434,7 +460,7 @@ static void safety_wdt_init(void)
 
 static void safety_wdt_register(void)
 {
-    if (!s_wdt_enabled) {
+    if (!s_safety.wdt_enabled) {
         return;
     }
 
@@ -446,7 +472,7 @@ static void safety_wdt_register(void)
 
 static void safety_wdt_kick(void)
 {
-    if (!s_wdt_enabled) {
+    if (!s_safety.wdt_enabled) {
         return;
     }
 
@@ -519,8 +545,8 @@ static void IRAM_ATTR water_level_isr(void *arg)
     (void)arg;
     int level = gpio_get_level((gpio_num_t)PIN_SENSOR_WATER_LEVEL);
     if (level == 0) {
-        s_water_level_low_tick = xTaskGetTickCountFromISR();
-        atomic_store(&s_water_level_low_isr, true);
+        s_safety.water_level_low_tick = xTaskGetTickCountFromISR();
+        atomic_store(&s_safety.water_level_low_isr, true);
 
         BaseType_t higher_priority_task_woken = pdFALSE;
         if (s_safety_task != NULL) {
@@ -622,10 +648,10 @@ static void safety_note_ph_dose(actuator_channel_t channel)
     }
 
     portENTER_CRITICAL(&s_safety_lock);
-    s_ph_response_pending = true;
-    s_ph_response_up = (channel == ACTUATOR_CHANNEL_PER_PH_UP);
-    s_ph_response_start = snap.ph;
-    s_ph_response_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SAFETY_PH_RESPONSE_TIMEOUT_MS);
+    s_safety.ph_response_pending = true;
+    s_safety.ph_response_up = (channel == ACTUATOR_CHANNEL_PER_PH_UP);
+    s_safety.ph_response_start = snap.ph;
+    s_safety.ph_response_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SAFETY_PH_RESPONSE_TIMEOUT_MS);
     portEXIT_CRITICAL(&s_safety_lock);
 }
 
@@ -646,10 +672,10 @@ static void safety_note_tds_dose(actuator_channel_t channel)
     }
 
     portENTER_CRITICAL(&s_safety_lock);
-    s_tds_response_pending = true;
-    s_tds_response_start = snap.tds;
-    s_tds_response_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SAFETY_TDS_RESPONSE_TIMEOUT_MS);
-    s_tds_response_fault = fault;
+    s_safety.tds_response_pending = true;
+    s_safety.tds_response_start = snap.tds;
+    s_safety.tds_response_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SAFETY_TDS_RESPONSE_TIMEOUT_MS);
+    s_safety.tds_response_fault = fault;
     portEXIT_CRITICAL(&s_safety_lock);
 }
 
@@ -782,6 +808,44 @@ static void publish_current_version(const char *zone_id)
     } else {
         ESP_LOGI(TAG, "Published version %s to %s", version, topic);
     }
+}
+
+static void publish_actuator_states(void)
+{
+    bool states[ACTUATOR_CHANNEL_COUNT] = {0};
+
+    portENTER_CRITICAL(&s_state_shadow_lock);
+    for (int i = 0; i < ACTUATOR_CHANNEL_COUNT; i++) {
+        states[i] = s_channel_state_on[i];
+    }
+    portEXIT_CRITICAL(&s_state_shadow_lock);
+
+    for (int i = 0; i < ACTUATOR_CHANNEL_COUNT; i++) {
+        const char *topic = actuator_control_get_status_topic((actuator_channel_t)i);
+        if (topic == NULL || topic[0] == '\0') {
+            continue;
+        }
+        esp_err_t ret = mqtt_manager_publish(topic, states[i] ? "ON" : "OFF", 1, 0);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "Failed to republish state for %s", topic);
+        }
+    }
+}
+
+static void runtime_tasks_on_mqtt_connection(bool connected, void *user_ctx)
+{
+    (void)user_ctx;
+
+    if (!connected) {
+        return;
+    }
+
+    if (!s_running || s_starting || s_zone_id[0] == '\0') {
+        return;
+    }
+
+    publish_current_version(s_zone_id);
+    publish_actuator_states();
 }
 
 typedef struct {
@@ -1074,6 +1138,11 @@ static void dosing_task(void *arg)
 
     while (!atomic_load(&s_stop_requested)) {
         if (xQueueReceive(s_dosing_queue, &cmd, pdMS_TO_TICKS(DOSING_QUEUE_RECV_TIMEOUT_MS)) == pdTRUE) {
+            if (atomic_load(&s_safety.safe_mode) || atomic_load(&s_stop_requested)) {
+                ESP_LOGW(TAG, "Dropping dosing command while in safe mode or stopping");
+                continue;
+            }
+
             if ((cmd.action == ACTUATOR_ACTION_ON || cmd.action == ACTUATOR_ACTION_PULSE) &&
                 ((cmd.channel == ACTUATOR_CHANNEL_PER_PH_UP && get_channel_state_on(ACTUATOR_CHANNEL_PER_PH_DOWN)) ||
                  (cmd.channel == ACTUATOR_CHANNEL_PER_PH_DOWN && get_channel_state_on(ACTUATOR_CHANNEL_PER_PH_UP)))) {
@@ -1116,10 +1185,10 @@ static void dosing_task(void *arg)
                 TickType_t now = xTaskGetTickCount();
                 portENTER_CRITICAL(&s_safety_lock);
                 if (cmd.action == ACTUATOR_ACTION_ON) {
-                    s_valve_on_tick = now;
-                    s_valve_waiting = true;
+                    s_safety.valve_on_tick = now;
+                    s_safety.valve_waiting = true;
                 } else if (cmd.action == ACTUATOR_ACTION_OFF) {
-                    s_valve_waiting = false;
+                    s_safety.valve_waiting = false;
                 }
                 portEXIT_CRITICAL(&s_safety_lock);
             }
@@ -1133,11 +1202,11 @@ static void dosing_task(void *arg)
             }
         }
 
-        safety_heartbeat(&s_dosing_heartbeat);
+        safety_heartbeat(&s_safety.dosing_heartbeat);
         safety_wdt_kick();
     }
 
-    if (s_wdt_enabled) {
+    if (s_safety.wdt_enabled) {
         esp_task_wdt_delete(NULL);
     }
 
@@ -1161,13 +1230,13 @@ static void sensor_task(void *arg)
             ESP_LOGW(TAG, "Sensor sample failed: %s", esp_err_to_name(ret));
         }
 
-        safety_heartbeat(&s_sensor_heartbeat);
+        safety_heartbeat(&s_safety.sensor_heartbeat);
         safety_wdt_kick();
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_SAMPLE_INTERVAL_MS));
     }
 
-    if (s_wdt_enabled) {
+    if (s_safety.wdt_enabled) {
         esp_task_wdt_delete(NULL);
     }
 
@@ -1176,6 +1245,41 @@ static void sensor_task(void *arg)
     s_sensor_task = NULL;
     portEXIT_CRITICAL(&s_task_handle_lock);
     vTaskDelete(NULL);
+}
+
+static void comm_task_publish_sensors(const sensor_telemetry_snapshot_t *snap,
+                                      const char *zone_id)
+{
+    (void)zone_id;
+    char buf[32];
+
+    /* ── Water level ──────────────────────────────────────────────────── */
+    snprintf(buf, sizeof(buf), "%d", snap->water_level);
+    mqtt_manager_publish(sensor_telemetry_topic_water_level(), buf, 0, 0);
+
+    /* ── Water temperature ────────────────────────────────────────────── */
+    snprintf(buf, sizeof(buf), "%.2f", (double)snap->water_temp);
+    mqtt_manager_publish(sensor_telemetry_topic_water_temp(), buf, 0, 0);
+
+    /* ── pH  raw / state / valid ──────────────────────────────────────── */
+    snprintf(buf, sizeof(buf), "%u", (unsigned)snap->ph_raw);
+    mqtt_manager_publish(sensor_telemetry_topic_ph_raw(), buf, 0, 0);
+
+    snprintf(buf, sizeof(buf), "%.2f", (double)snap->ph);
+    mqtt_manager_publish(sensor_telemetry_topic_ph(), buf, 0, 0);
+
+    mqtt_manager_publish(sensor_telemetry_topic_ph_valid(),
+                         snap->ph_valid ? "true" : "false", 0, /*retain=*/1);
+
+    /* ── TDS  raw / state / valid ─────────────────────────────────────── */
+    snprintf(buf, sizeof(buf), "%u", (unsigned)snap->tds_raw);
+    mqtt_manager_publish(sensor_telemetry_topic_tds_raw(), buf, 0, 0);
+
+    snprintf(buf, sizeof(buf), "%.1f", (double)snap->tds);
+    mqtt_manager_publish(sensor_telemetry_topic_tds(), buf, 0, 0);
+
+    mqtt_manager_publish(sensor_telemetry_topic_tds_valid(),
+                         snap->tds_valid ? "true" : "false", 0, /*retain=*/1);
 }
 
 static void comm_task(void *arg)
@@ -1221,20 +1325,7 @@ static void comm_task(void *arg)
         }
 
         if (snapshot_available) {
-            char payload_level[8];
-            char payload_temp[16];
-            char payload_ph[16];
-            char payload_tds[16];
-
-            snprintf(payload_level, sizeof(payload_level), "%d", snap.water_level);
-            snprintf(payload_temp, sizeof(payload_temp), "%.2f", (double)snap.water_temp);
-            snprintf(payload_ph, sizeof(payload_ph), "%.2f", (double)snap.ph);
-            snprintf(payload_tds, sizeof(payload_tds), "%.2f", (double)snap.tds);
-
-            mqtt_manager_publish(sensor_telemetry_topic_water_level(), payload_level, 0, 0);
-            mqtt_manager_publish(sensor_telemetry_topic_water_temp(), payload_temp, 0, 0);
-            mqtt_manager_publish(sensor_telemetry_topic_ph(), payload_ph, 0, 0);
-            mqtt_manager_publish(sensor_telemetry_topic_tds(), payload_tds, 0, 0);
+            comm_task_publish_sensors(&snap, s_zone_id);
         }
 
         actuator_last_command_t latest_cmd;
@@ -1262,13 +1353,13 @@ static void comm_task(void *arg)
             }
         }
 
-        safety_heartbeat(&s_comm_heartbeat);
+        safety_heartbeat(&s_safety.comm_heartbeat);
         safety_wdt_kick();
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(COMM_INTERVAL_MS));
     }
 
-    if (s_wdt_enabled) {
+    if (s_safety.wdt_enabled) {
         esp_task_wdt_delete(NULL);
     }
 
@@ -1285,9 +1376,9 @@ static void safety_task(void *arg)
     safety_wdt_register();
 
     TickType_t last_wake = xTaskGetTickCount();
-    uint32_t last_dosing_hb = atomic_load(&s_dosing_heartbeat);
-    uint32_t last_sensor_hb = atomic_load(&s_sensor_heartbeat);
-    uint32_t last_comm_hb = atomic_load(&s_comm_heartbeat);
+    uint32_t last_dosing_hb = atomic_load(&s_safety.dosing_heartbeat);
+    uint32_t last_sensor_hb = atomic_load(&s_safety.sensor_heartbeat);
+    uint32_t last_comm_hb = atomic_load(&s_safety.comm_heartbeat);
     TickType_t dosing_last_change = last_wake;
     TickType_t sensor_last_change = last_wake;
     TickType_t comm_last_change = last_wake;
@@ -1309,7 +1400,7 @@ static void safety_task(void *arg)
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SAFETY_INTERVAL_MS));
         TickType_t now = xTaskGetTickCount();
 
-        safety_heartbeat(&s_safety_heartbeat);
+        safety_heartbeat(&s_safety.safety_heartbeat);
         safety_wdt_kick();
 
         if (!counters_cleared && ticks_to_ms(now) > (SAFETY_RESET_WINDOW_SEC * 1000u)) {
@@ -1318,21 +1409,21 @@ static void safety_task(void *arg)
             counters_cleared = true;
         }
 
-        safety_check_heartbeat(s_dosing_task, &s_dosing_heartbeat,
+        safety_check_heartbeat(s_dosing_task, &s_safety.dosing_heartbeat,
                                &last_dosing_hb, &dosing_last_change,
                                now, "Dosing task heartbeat stalled");
-        safety_check_heartbeat(s_sensor_task, &s_sensor_heartbeat,
+        safety_check_heartbeat(s_sensor_task, &s_safety.sensor_heartbeat,
                                &last_sensor_hb, &sensor_last_change,
                                now, "Sensor task heartbeat stalled");
-        safety_check_heartbeat(s_comm_task, &s_comm_heartbeat,
+        safety_check_heartbeat(s_comm_task, &s_safety.comm_heartbeat,
                                &last_comm_hb, &comm_last_change,
                                now, "Comm task heartbeat stalled");
 
-        if (atomic_load(&s_water_level_low_isr)) {
-            if (ticks_to_ms(now - s_water_level_low_tick) >= SAFETY_LEVEL_LOW_DEBOUNCE_MS) {
+        if (atomic_load(&s_safety.water_level_low_isr)) {
+            if (ticks_to_ms(now - s_safety.water_level_low_tick) >= SAFETY_LEVEL_LOW_DEBOUNCE_MS) {
                 safety_fault_set(SAFETY_FAULT_WATER_LEVEL, "Water level low ISR");
             }
-            atomic_store(&s_water_level_low_isr, false);
+            atomic_store(&s_safety.water_level_low_isr, false);
         }
 
         sensor_telemetry_snapshot_t snap = {0};
@@ -1422,10 +1513,10 @@ static void safety_task(void *arg)
                 TickType_t ph_deadline = 0;
                 float ph_start = 0.0f;
                 portENTER_CRITICAL(&s_safety_lock);
-                ph_pending = s_ph_response_pending;
-                ph_up = s_ph_response_up;
-                ph_deadline = s_ph_response_deadline;
-                ph_start = s_ph_response_start;
+                ph_pending = s_safety.ph_response_pending;
+                ph_up = s_safety.ph_response_up;
+                ph_deadline = s_safety.ph_response_deadline;
+                ph_start = s_safety.ph_response_start;
                 portEXIT_CRITICAL(&s_safety_lock);
 
                 if (ph_pending) {
@@ -1433,14 +1524,14 @@ static void safety_task(void *arg)
                     if ((ph_up && delta >= SAFETY_PH_RESPONSE_MIN_DELTA) ||
                         (!ph_up && delta <= -SAFETY_PH_RESPONSE_MIN_DELTA)) {
                         portENTER_CRITICAL(&s_safety_lock);
-                        s_ph_response_pending = false;
+                        s_safety.ph_response_pending = false;
                         portEXIT_CRITICAL(&s_safety_lock);
                     } else if ((int32_t)(now - ph_deadline) < 0) {
                         /* Deadline not reached yet. */
                     } else {
                         safety_fault_set(ph_up ? SAFETY_FAULT_PH_UP : SAFETY_FAULT_PH_DOWN, "pH response timeout");
                         portENTER_CRITICAL(&s_safety_lock);
-                        s_ph_response_pending = false;
+                        s_safety.ph_response_pending = false;
                         portEXIT_CRITICAL(&s_safety_lock);
                     }
                 }
@@ -1450,17 +1541,17 @@ static void safety_task(void *arg)
                 float tds_start = 0.0f;
                 safety_fault_mask_t tds_fault = 0;
                 portENTER_CRITICAL(&s_safety_lock);
-                tds_pending = s_tds_response_pending;
-                tds_deadline = s_tds_response_deadline;
-                tds_start = s_tds_response_start;
-                tds_fault = s_tds_response_fault;
+                tds_pending = s_safety.tds_response_pending;
+                tds_deadline = s_safety.tds_response_deadline;
+                tds_start = s_safety.tds_response_start;
+                tds_fault = s_safety.tds_response_fault;
                 portEXIT_CRITICAL(&s_safety_lock);
 
                 if (tds_pending) {
                     float delta = snap.tds - tds_start;
                     if (fabsf(delta) >= SAFETY_TDS_RESPONSE_MIN_DELTA) {
                         portENTER_CRITICAL(&s_safety_lock);
-                        s_tds_response_pending = false;
+                        s_safety.tds_response_pending = false;
                         portEXIT_CRITICAL(&s_safety_lock);
                     } else if ((int32_t)(now - tds_deadline) < 0) {
                         /* Deadline not reached yet. */
@@ -1469,7 +1560,7 @@ static void safety_task(void *arg)
                             safety_fault_set(tds_fault, "TDS response timeout");
                         }
                         portENTER_CRITICAL(&s_safety_lock);
-                        s_tds_response_pending = false;
+                        s_safety.tds_response_pending = false;
                         portEXIT_CRITICAL(&s_safety_lock);
                     }
                 }
@@ -1478,15 +1569,15 @@ static void safety_task(void *arg)
             TickType_t valve_on_tick = 0;
             bool valve_waiting = false;
             portENTER_CRITICAL(&s_safety_lock);
-            valve_on_tick = s_valve_on_tick;
-            valve_waiting = s_valve_waiting;
+            valve_on_tick = s_safety.valve_on_tick;
+            valve_waiting = s_safety.valve_waiting;
             portEXIT_CRITICAL(&s_safety_lock);
 
             if (valve_waiting && valve_on_tick != 0 && snap.water_level == 0) {
                 if (ticks_to_ms(now - valve_on_tick) > SAFETY_FILL_TIMEOUT_MS) {
                     safety_fault_set(SAFETY_FAULT_FILL_TIMEOUT | SAFETY_FAULT_VALVE, "Valve fill timeout");
                     portENTER_CRITICAL(&s_safety_lock);
-                    s_valve_waiting = false;
+                    s_safety.valve_waiting = false;
                     portEXIT_CRITICAL(&s_safety_lock);
                 }
             }
@@ -1495,7 +1586,7 @@ static void safety_task(void *arg)
         last_wake = now;
     }
 
-    if (s_wdt_enabled) {
+    if (s_safety.wdt_enabled) {
         esp_task_wdt_delete(NULL);
     }
 
@@ -1512,6 +1603,9 @@ static void cleanup_runtime_locked(void)
     s_gate_open = false;
     portEXIT_CRITICAL(&s_cmd_gate_lock);
     atomic_store(&s_stop_requested, true);
+
+    flush_dosing_queue("runtime stop");
+    (void)mqtt_manager_set_connection_cb(NULL, NULL);
 
     const mqtt_unsub_entry_t unsub_entries[] = {
         { &s_zone_topic_subscribed, s_zone_command_topic },
@@ -1606,25 +1700,219 @@ void runtime_tasks_record_boot_faults(void)
         if (s_wdt_reset_count < UINT32_MAX) {
             s_wdt_reset_count++;
         }
-        s_boot_faults |= SAFETY_FAULT_WDT;
+        s_safety.boot_faults |= SAFETY_FAULT_WDT;
     }
 
     if (reason == ESP_RST_BROWNOUT) {
-        s_boot_faults |= SAFETY_FAULT_POWER;
+        s_safety.boot_faults |= SAFETY_FAULT_POWER;
     }
 
     if (s_reset_count > SAFETY_RESET_MAX_COUNT) {
-        s_boot_faults |= SAFETY_FAULT_POWER;
+        s_safety.boot_faults |= SAFETY_FAULT_POWER;
     }
 
     if (s_wdt_reset_count > SAFETY_WDT_RESET_MAX_COUNT) {
-        s_boot_faults |= SAFETY_FAULT_WDT;
+        s_safety.boot_faults |= SAFETY_FAULT_WDT;
     }
 
     ESP_LOGI(TAG, "Reset reason=%d reset_count=%lu wdt_count=%lu",
              (int)reason,
              (unsigned long)s_reset_count,
              (unsigned long)s_wdt_reset_count);
+}
+
+static void runtime_prepare_state(const char *zone_id)
+{
+    atomic_store(&s_stop_requested, false);
+    portENTER_CRITICAL(&s_cmd_gate_lock);
+    s_gate_open = false;
+    portEXIT_CRITICAL(&s_cmd_gate_lock);
+    clear_subscription_tracking();
+    s_ota_latest_version[0] = '\0';
+
+    reset_heartbeats();
+    atomic_store(&s_safety.water_level_low_isr, false);
+    portENTER_CRITICAL(&s_safety_lock);
+    s_safety.ph_response_pending = false;
+    s_safety.tds_response_pending = false;
+    s_safety.tds_response_fault = 0;
+    s_safety.valve_waiting = false;
+    portEXIT_CRITICAL(&s_safety_lock);
+    memset(s_channel_state_on, 0, sizeof(s_channel_state_on));
+    memset(s_dose_watchdog, 0, sizeof(s_dose_watchdog));
+
+    SAFE_STRCPY(s_zone_id, zone_id);
+    memset(&s_last_lcd_rendered_cmd, 0, sizeof(s_last_lcd_rendered_cmd));
+    memset(&s_last_good_snapshot, 0, sizeof(s_last_good_snapshot));
+    s_last_good_snapshot_valid = false;
+
+    zone_config_t zone_cfg;
+    bool zone_found = false;
+    esp_err_t zone_ret = zone_config_load(&zone_cfg, &zone_found);
+    if (zone_ret == ESP_OK && zone_found && strcmp(zone_cfg.zone_id, zone_id) == 0) {
+        SAFE_STRCPY(s_zone_name, zone_cfg.zone_name);
+    } else {
+        SAFE_STRCPY(s_zone_name, "Unknown");
+    }
+}
+
+static esp_err_t runtime_setup_resources(const char *zone_id)
+{
+    esp_err_t ret = actuator_control_init(zone_id);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = sensor_telemetry_init(zone_id);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    safety_wdt_init();
+
+    s_dosing_queue = xQueueCreate(DOSING_QUEUE_LEN, sizeof(dosing_command_t));
+    if (s_dosing_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (s_snapshot_mutex == NULL) {
+        s_snapshot_mutex = xSemaphoreCreateMutex();
+        if (s_snapshot_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (s_task_exit_event == NULL) {
+        s_task_exit_event = xEventGroupCreate();
+        if (s_task_exit_event == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xEventGroupClearBits(s_task_exit_event, TASK_EXIT_ALL_BITS);
+
+    return ESP_OK;
+}
+
+static esp_err_t runtime_setup_topics(const char *zone_id)
+{
+    esp_err_t ret = subscribe_formatted_topic(s_zone_command_topic, ZONE_TOPIC_BUFFER_SIZE,
+                                              "%s/command", zone_id, NULL,
+                                              on_zone_command, NULL, &s_zone_topic_subscribed);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = write_topic(s_safety_fault_topic, ZONE_TOPIC_BUFFER_SIZE,
+                      "%s/%s", zone_id, SAFETY_FAULT_TOPIC_SUFFIX);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = subscribe_formatted_topic(s_safety_clear_topic, ZONE_TOPIC_BUFFER_SIZE,
+                                    "%s/%s", zone_id, SAFETY_CLEAR_TOPIC_SUFFIX,
+                                    on_safety_clear_command, NULL, &s_safety_topic_subscribed);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = subscribe_formatted_topic(s_ota_latest_topic, ZONE_TOPIC_BUFFER_SIZE,
+                                    "%s/ota/latest_version", zone_id, NULL,
+                                    on_ota_latest_version, NULL, &s_ota_latest_subscribed);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = subscribe_formatted_topic(s_ota_trigger_topic, ZONE_TOPIC_BUFFER_SIZE,
+                                    "%s/ota/trigger", zone_id, NULL,
+                                    on_ota_trigger, NULL, &s_ota_trigger_subscribed);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    publish_current_version(zone_id);
+    (void)mqtt_manager_set_connection_cb(runtime_tasks_on_mqtt_connection, NULL);
+    if (mqtt_manager_is_connected()) {
+        runtime_tasks_on_mqtt_connection(true, NULL);
+    }
+
+    for (int i = 0; i < ACTUATOR_CHANNEL_COUNT; i++) {
+        const char *topic = actuator_control_get_command_topic((actuator_channel_t)i);
+        if (topic == NULL || topic[0] == '\0') {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        ret = mqtt_manager_subscribe(topic, 1, on_channel_command, (void *)(intptr_t)i);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        s_channel_topics_subscribed[i] = true;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t runtime_setup_isr(void)
+{
+    esp_err_t ret = ESP_OK;
+
+    if (!s_isr_installed) {
+        ret = gpio_install_isr_service(0);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            return ret;
+        }
+        s_isr_installed = true;
+    }
+
+    ret = gpio_set_intr_type((gpio_num_t)PIN_SENSOR_WATER_LEVEL, GPIO_INTR_ANYEDGE);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_isr_handler_add((gpio_num_t)PIN_SENSOR_WATER_LEVEL, water_level_isr, NULL);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+static void runtime_apply_boot_faults(void)
+{
+    atomic_store(&s_safety.reported_faults, 0);
+    if (s_safety.boot_faults != 0) {
+        safety_fault_set(s_safety.boot_faults, "Boot fault");
+    }
+
+    safety_fault_mask_t existing_faults = (safety_fault_mask_t)atomic_load(&s_safety.faults);
+    if (existing_faults != 0) {
+        safety_enter_safe_state(existing_faults);
+        safety_publish_faults(existing_faults);
+    }
+}
+
+static esp_err_t runtime_start_workers(void)
+{
+    BaseType_t ok = xTaskCreate(dosing_task, "DosingTask", DOSING_TASK_STACK, NULL, DOSING_TASK_PRIORITY, &s_dosing_task);
+    if (ok != pdPASS) {
+        return ESP_FAIL;
+    }
+
+    ok = xTaskCreate(sensor_task, "SensorTask", SENSOR_TASK_STACK, NULL, SENSOR_TASK_PRIORITY, &s_sensor_task);
+    if (ok != pdPASS) {
+        return ESP_FAIL;
+    }
+
+    ok = xTaskCreate(comm_task, "CommTask", COMM_TASK_STACK, NULL, COMM_TASK_PRIORITY, &s_comm_task);
+    if (ok != pdPASS) {
+        return ESP_FAIL;
+    }
+
+    ok = xTaskCreate(safety_task, "SafetyTask", SAFETY_TASK_STACK, NULL, SAFETY_TASK_PRIORITY, &s_safety_task);
+    if (ok != pdPASS) {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t runtime_tasks_start(const char *zone_id)
@@ -1644,207 +1932,39 @@ esp_err_t runtime_tasks_start(const char *zone_id)
     }
 
     s_starting = true;
-    atomic_store(&s_stop_requested, false);
-    portENTER_CRITICAL(&s_cmd_gate_lock);
-    s_gate_open = false;
-    portEXIT_CRITICAL(&s_cmd_gate_lock);
-    clear_subscription_tracking();
-    s_ota_latest_version[0] = '\0';
+    runtime_prepare_state(zone_id);
 
-    reset_heartbeats();
-    atomic_store(&s_water_level_low_isr, false);
-    portENTER_CRITICAL(&s_safety_lock);
-    s_ph_response_pending = false;
-    s_tds_response_pending = false;
-    s_tds_response_fault = 0;
-    s_valve_waiting = false;
-    portEXIT_CRITICAL(&s_safety_lock);
-    memset(s_channel_state_on, 0, sizeof(s_channel_state_on));
-    memset(s_dose_watchdog, 0, sizeof(s_dose_watchdog));
-
-    SAFE_STRCPY(s_zone_id, zone_id);
-    memset(&s_last_lcd_rendered_cmd, 0, sizeof(s_last_lcd_rendered_cmd));
-    memset(&s_last_good_snapshot, 0, sizeof(s_last_good_snapshot));
-    s_last_good_snapshot_valid = false;
-
-    zone_config_t zone_cfg;
-    bool zone_found = false;
-    esp_err_t zone_ret = zone_config_load(&zone_cfg, &zone_found);
-    if (zone_ret == ESP_OK && zone_found && strcmp(zone_cfg.zone_id, zone_id) == 0) {
-        SAFE_STRCPY(s_zone_name, zone_cfg.zone_name);
-    } else {
-        SAFE_STRCPY(s_zone_name, "Unknown");
-    }
-
-    ret = actuator_control_init(zone_id);
+    ret = runtime_setup_resources(zone_id);
     if (ret != ESP_OK) {
         cleanup_runtime_locked();
         runtime_unlock();
         return ret;
     }
 
-    ret = sensor_telemetry_init(zone_id);
+    ret = runtime_setup_topics(zone_id);
     if (ret != ESP_OK) {
         cleanup_runtime_locked();
         runtime_unlock();
         return ret;
     }
 
-    safety_wdt_init();
-
-    s_dosing_queue = xQueueCreate(DOSING_QUEUE_LEN, sizeof(dosing_command_t));
-    if (s_dosing_queue == NULL) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (s_snapshot_mutex == NULL) {
-        s_snapshot_mutex = xSemaphoreCreateMutex();
-        if (s_snapshot_mutex == NULL) {
-            cleanup_runtime_locked();
-            runtime_unlock();
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (s_task_exit_event == NULL) {
-        s_task_exit_event = xEventGroupCreate();
-        if (s_task_exit_event == NULL) {
-            cleanup_runtime_locked();
-            runtime_unlock();
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    xEventGroupClearBits(s_task_exit_event, TASK_EXIT_ALL_BITS);
-
-    ret = subscribe_formatted_topic(s_zone_command_topic, ZONE_TOPIC_BUFFER_SIZE,
-                                    "%s/command", zone_id, NULL,
-                                    on_zone_command, NULL, &s_zone_topic_subscribed);
+    ret = runtime_setup_isr();
     if (ret != ESP_OK) {
         cleanup_runtime_locked();
         runtime_unlock();
         return ret;
     }
 
-    ret = write_topic(s_safety_fault_topic, ZONE_TOPIC_BUFFER_SIZE,
-                      "%s/%s", zone_id, SAFETY_FAULT_TOPIC_SUFFIX);
+    runtime_apply_boot_faults();
+
+    ret = runtime_start_workers();
     if (ret != ESP_OK) {
         cleanup_runtime_locked();
         runtime_unlock();
         return ret;
     }
 
-    ret = subscribe_formatted_topic(s_safety_clear_topic, ZONE_TOPIC_BUFFER_SIZE,
-                                    "%s/%s", zone_id, SAFETY_CLEAR_TOPIC_SUFFIX,
-                                    on_safety_clear_command, NULL, &s_safety_topic_subscribed);
-    if (ret != ESP_OK) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ret;
-    }
-
-    ret = subscribe_formatted_topic(s_ota_latest_topic, ZONE_TOPIC_BUFFER_SIZE,
-                                    "%s/ota/latest_version", zone_id, NULL,
-                                    on_ota_latest_version, NULL, &s_ota_latest_subscribed);
-    if (ret != ESP_OK) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ret;
-    }
-
-    ret = subscribe_formatted_topic(s_ota_trigger_topic, ZONE_TOPIC_BUFFER_SIZE,
-                                    "%s/ota/trigger", zone_id, NULL,
-                                    on_ota_trigger, NULL, &s_ota_trigger_subscribed);
-    if (ret != ESP_OK) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ret;
-    }
-
-    publish_current_version(zone_id);
-
-    for (int i = 0; i < ACTUATOR_CHANNEL_COUNT; i++) {
-        const char *topic = actuator_control_get_command_topic((actuator_channel_t)i);
-        if (topic == NULL || topic[0] == '\0') {
-            cleanup_runtime_locked();
-            runtime_unlock();
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        ret = mqtt_manager_subscribe(topic, 1, on_channel_command, (void *)(intptr_t)i);
-        if (ret != ESP_OK) {
-            cleanup_runtime_locked();
-            runtime_unlock();
-            return ret;
-        }
-        s_channel_topics_subscribed[i] = true;
-    }
-
-    if (!s_isr_installed) {
-        ret = gpio_install_isr_service(0);
-        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            cleanup_runtime_locked();
-            runtime_unlock();
-            return ret;
-        }
-        s_isr_installed = true;
-    }
-
-    ret = gpio_set_intr_type((gpio_num_t)PIN_SENSOR_WATER_LEVEL, GPIO_INTR_ANYEDGE);
-    if (ret != ESP_OK) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ret;
-    }
-
-    ret = gpio_isr_handler_add((gpio_num_t)PIN_SENSOR_WATER_LEVEL, water_level_isr, NULL);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ret;
-    }
-
-    atomic_store(&s_reported_faults, 0);
-    if (s_boot_faults != 0) {
-        safety_fault_set(s_boot_faults, "Boot fault");
-    }
-
-    safety_fault_mask_t existing_faults = (safety_fault_mask_t)atomic_load(&s_safety_faults);
-    if (existing_faults != 0) {
-        safety_enter_safe_state(existing_faults);
-        safety_publish_faults(existing_faults);
-    }
-
-    BaseType_t ok = xTaskCreate(dosing_task, "DosingTask", DOSING_TASK_STACK, NULL, DOSING_TASK_PRIORITY, &s_dosing_task);
-    if (ok != pdPASS) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ESP_FAIL;
-    }
-
-    ok = xTaskCreate(sensor_task, "SensorTask", SENSOR_TASK_STACK, NULL, SENSOR_TASK_PRIORITY, &s_sensor_task);
-    if (ok != pdPASS) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ESP_FAIL;
-    }
-
-    ok = xTaskCreate(comm_task, "CommTask", COMM_TASK_STACK, NULL, COMM_TASK_PRIORITY, &s_comm_task);
-    if (ok != pdPASS) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ESP_FAIL;
-    }
-
-    ok = xTaskCreate(safety_task, "SafetyTask", SAFETY_TASK_STACK, NULL, SAFETY_TASK_PRIORITY, &s_safety_task);
-    if (ok != pdPASS) {
-        cleanup_runtime_locked();
-        runtime_unlock();
-        return ESP_FAIL;
-    }
-
-    if (!atomic_load(&s_safe_mode)) {
+    if (!atomic_load(&s_safety.safe_mode)) {
         portENTER_CRITICAL(&s_cmd_gate_lock);
         s_gate_open = true;
         portEXIT_CRITICAL(&s_cmd_gate_lock);
@@ -1895,33 +2015,33 @@ bool runtime_tasks_is_running(void)
 
 safety_fault_mask_t runtime_tasks_get_safety_faults(void)
 {
-    return (safety_fault_mask_t)atomic_load(&s_safety_faults);
+    return (safety_fault_mask_t)atomic_load(&s_safety.faults);
 }
 
 esp_err_t runtime_tasks_clear_safety_faults(safety_fault_mask_t mask)
 {
-    safety_fault_mask_t current = (safety_fault_mask_t)atomic_load(&s_safety_faults);
+    safety_fault_mask_t current = (safety_fault_mask_t)atomic_load(&s_safety.faults);
     if (mask == 0) {
         mask = current;
     }
 
     safety_fault_mask_t new_mask = current & ~mask;
-    atomic_store(&s_safety_faults, (unsigned int)new_mask);
-    atomic_store(&s_reported_faults, (unsigned int)new_mask);
+    atomic_store(&s_safety.faults, (unsigned int)new_mask);
+    atomic_store(&s_safety.reported_faults, (unsigned int)new_mask);
 
     if (mask == current) {
-        s_boot_faults = 0;
+        s_safety.boot_faults = 0;
     } else {
-        s_boot_faults &= ~mask;
+        s_safety.boot_faults &= ~mask;
     }
 
     if (new_mask == 0) {
-        atomic_store(&s_safe_mode, false);
-        atomic_store(&s_water_level_low_isr, false);
+        atomic_store(&s_safety.safe_mode, false);
+        atomic_store(&s_safety.water_level_low_isr, false);
         portENTER_CRITICAL(&s_safety_lock);
-        s_ph_response_pending = false;
-        s_tds_response_pending = false;
-        s_valve_waiting = false;
+        s_safety.ph_response_pending = false;
+        s_safety.tds_response_pending = false;
+        s_safety.valve_waiting = false;
         portEXIT_CRITICAL(&s_safety_lock);
 
         if (s_running && !s_starting && !atomic_load(&s_stop_requested)) {
@@ -1936,5 +2056,5 @@ esp_err_t runtime_tasks_clear_safety_faults(safety_fault_mask_t mask)
 
 bool runtime_tasks_is_safe_mode(void)
 {
-    return atomic_load(&s_safe_mode);
+    return atomic_load(&s_safety.safe_mode);
 }

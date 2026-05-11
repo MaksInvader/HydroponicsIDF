@@ -10,6 +10,7 @@ idf_component_register(
         "setup_config.c"
         "actuator_control.c"
         "sensor_telemetry.c"
+        "sensor_calibration_nvs.c"
         "runtime_tasks.c"
     INCLUDE_DIRS "."
     REQUIRES

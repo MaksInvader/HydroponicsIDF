@@ -16,6 +16,11 @@
 #define PIN_SENSOR_WATER_TEMP_ADC_UNIT     ADC_UNIT_1
 #define PIN_SENSOR_WATER_TEMP_ADC_CHANNEL  ADC_CHANNEL_3 /* GPIO4 on ESP32-S3 */
 
+/* pH and TDS sensors — direct GPIO digital output (not ADC).
+ * Set these to the GPIO numbers your modules are wired to. */
+#define PIN_SENSOR_PH   5   /* TODO: replace with your actual GPIO number */
+#define PIN_SENSOR_TDS  6   /* TODO: replace with your actual GPIO number */
+
 /* LCD I2C pins */
 #define PIN_LCD_I2C_PORT     I2C_NUM_0
 #define PIN_LCD_I2C_SDA      15
