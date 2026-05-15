@@ -3,8 +3,8 @@
  *
  * Data flow
  * ─────────
- *   Water-temp: ADC raw (N samples) ──► filtered average ──► apply calibration
- *     ──► validate range ──► snapshot ──► publish raw / state / valid
+ *   Water-temp: DS18B20 1-Wire (trigger→read across cycles) ──► rolling average
+ *     ──► snapshot ──► publish state
  *   pH / TDS:   GPIO digital level ──► apply calibration
  *     ──► validate range ──► snapshot ──► publish raw / state / valid
  *
@@ -33,12 +33,12 @@
 #include <string.h>
 
 #include "driver/gpio.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
+#include "onewire_bus.h"
+#include "ds18b20.h"
 #include "freertos/FreeRTOS.h"
 
+#include "esp_timer.h"
 #include "mqtt_manager.h"
 #include "pin_config.h"
 #include "sensor_calibration_nvs.h"
@@ -48,25 +48,39 @@
  * Tunables
  * -------------------------------------------------------------------------- */
 
-/** Number of ADC samples to average per call (water temperature only). */
-#define ADC_OVERSAMPLE_COUNT    16
-
 /** Rolling window depth for the per-sensor moving average (all sensors). */
 #define SENSOR_SAMPLE_WINDOW    30
 
-/** ESP-IDF ADC configuration for all analogue sensor channels. */
-#define SENSOR_ADC_ATTEN        ADC_ATTEN_DB_12
-#define SENSOR_ADC_BITWIDTH     ADC_BITWIDTH_12
-
-/** Maximum raw ADC count (12-bit). Water-temp readings at rail are treated as faults. */
-#define ADC_RAW_MAX             4095
-#define ADC_RAW_STUCK_MARGIN    10  /* counts within 0 or max are "stuck"    */
+/** DS18B20 12-bit conversion time in milliseconds. */
+#define DS18B20_CONVERSION_MS   750
 
 /** Valid physical ranges — readings outside these mark the reading invalid. */
 #define PH_VALUE_MIN            0.0f
 #define PH_VALUE_MAX            14.0f
 #define TDS_VALUE_MIN           0.0f
 #define TDS_VALUE_MAX           5000.0f  /* ppm; adjust for your application */
+
+/* --------------------------------------------------------------------------
+ * Calibration plausible ranges
+ * -------------------------------------------------------------------------- */
+#define PH_SLOPE_MIN    (-20.0f)
+#define PH_SLOPE_MAX    ( 20.0f)
+#define PH_OFFSET_MIN   (-50.0f)
+#define PH_OFFSET_MAX   ( 50.0f)
+
+#define TDS_SLOPE_MIN   (-100.0f)
+#define TDS_SLOPE_MAX   ( 100.0f)
+#define TDS_OFFSET_MIN  (-500.0f)
+#define TDS_OFFSET_MAX  ( 500.0f)
+
+/* --------------------------------------------------------------------------
+ * Calibration retry / timing constants
+ * -------------------------------------------------------------------------- */
+#define CALI_SUB_RETRY_COUNT     3
+#define CALI_SUB_RETRY_DELAY_MS  2000
+#define CALI_PUB_RETRY_COUNT     3
+#define CALI_PUB_RETRY_DELAY_MS  1000
+#define CALI_NVS_RETRY_COUNT     2   /* up to 2 additional attempts = 3 total */
 
 /* --------------------------------------------------------------------------
  * Topic buffer sizes
@@ -101,7 +115,7 @@ typedef struct {
 
 /** One sensor's averaged raw reading plus the derived physical value. */
 typedef struct {
-    uint16_t raw;   /* averaged ADC counts                               */
+    uint16_t raw;   /* raw sensor value (GPIO level for pH/TDS)          */
     float    value; /* calibrated physical value (pH / ppm)              */
     bool     valid; /* true only when calibration + range checks pass    */
 } sensor_reading_t;
@@ -113,9 +127,11 @@ typedef struct {
 static const char *TAG = "sensor_telem";
 
 static sensor_topics_t            s_topics;
-static adc_oneshot_unit_handle_t  s_adc_handle;
-static adc_cali_handle_t          s_adc_cali;
-static bool                       s_adc_cali_ready;
+static onewire_bus_handle_t       s_ow_bus    = NULL;
+static ds18b20_device_handle_t    s_ds18b20   = NULL;
+static bool                       s_ow_ready  = false;
+/* true after the first conversion trigger; read is deferred to next cycle */
+static bool                       s_ow_conversion_pending = false;
 static bool                       s_initialized;
 
 static portMUX_TYPE               s_snapshot_lock  = portMUX_INITIALIZER_UNLOCKED;
@@ -134,6 +150,10 @@ static size_t s_history_count;
 static calibration_t s_ph_cali;
 static calibration_t s_tds_cali;
 
+/* Deferred publish flags — set when MQTT was not connected at boot */
+static bool s_ph_pub_pending;
+static bool s_tds_pub_pending;
+
 /* --------------------------------------------------------------------------
  * Forward declarations
  * -------------------------------------------------------------------------- */
@@ -141,6 +161,7 @@ static void on_cali_ph_set(const char *topic, const char *payload,
                            int payload_len, void *user_ctx);
 static void on_cali_tds_set(const char *topic, const char *payload,
                             int payload_len, void *user_ctx);
+static void on_mqtt_connected(bool connected, void *user_ctx);
 
 /* --------------------------------------------------------------------------
  * Utilities
@@ -164,107 +185,99 @@ static void reset_state_locked(void)
     s_history_count = 0;
 }
 
-/** Return true when the raw count looks like a stuck rail. */
-static bool adc_raw_is_stuck(int raw)
-{
-    return (raw <= ADC_RAW_STUCK_MARGIN) ||
-           (raw >= (ADC_RAW_MAX - ADC_RAW_STUCK_MARGIN));
-}
-
 /* --------------------------------------------------------------------------
- * ADC helpers
+ * DS18B20 1-Wire helpers
  * -------------------------------------------------------------------------- */
 
 /**
- * @brief  Read one ADC channel, oversampling ADC_OVERSAMPLE_COUNT times.
+ * @brief  Initialise the 1-Wire bus and discover the DS18B20.
  *
- * @param  channel   ADC channel to read.
- * @param  out_raw   Average raw ADC count (0–4095).
- * @param  out_mv    Average voltage in mV (uses curve-fitting if available).
- * @return ESP_OK, or ESP_FAIL if the read fails.
+ * Expects a single DS18B20 on PIN_SENSOR_WATER_TEMP_ONEWIRE.
+ * Sets s_ow_ready = true on success.
  */
-static esp_err_t adc_read_averaged(adc_channel_t channel,
-                                   uint16_t *out_raw, int *out_mv)
+static void ow_init(void)
 {
-    if (s_adc_handle == NULL) return ESP_ERR_INVALID_STATE;
+    onewire_bus_config_t bus_cfg = {
+        .bus_gpio_num = PIN_SENSOR_WATER_TEMP_ONEWIRE,
+    };
+    onewire_bus_rmt_config_t rmt_cfg = {
+        .max_rx_bytes = 10,
+    };
 
-    int32_t sum_raw = 0;
-    int     failures = 0;
-
-    for (int i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
-        int raw = 0;
-        if (adc_oneshot_read(s_adc_handle, channel, &raw) == ESP_OK) {
-            sum_raw += raw;
-        } else {
-            failures++;
-        }
+    esp_err_t ret = onewire_new_bus_rmt(&bus_cfg, &rmt_cfg, &s_ow_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "1-Wire bus init failed: %s", esp_err_to_name(ret));
+        return;
     }
 
-    int valid_samples = ADC_OVERSAMPLE_COUNT - failures;
-    if (valid_samples == 0) {
-        *out_raw = 0;
-        *out_mv  = 0;
-        return ESP_FAIL;
+    /* Enumerate — expect exactly one device */
+    onewire_device_iter_handle_t iter = NULL;
+    ret = onewire_new_device_iter(s_ow_bus, &iter);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "1-Wire iter create failed: %s", esp_err_to_name(ret));
+        return;
     }
 
-    int avg_raw = (int)(sum_raw / valid_samples);
+    onewire_device_t dev;
+    esp_err_t search_ret = onewire_device_iter_get_next(iter, &dev);
+    onewire_del_device_iter(iter);
 
-    int mv = 0;
-    if (s_adc_cali_ready) {
-        if (adc_cali_raw_to_voltage(s_adc_cali, avg_raw, &mv) != ESP_OK) {
-            mv = (avg_raw * 3300) / ADC_RAW_MAX;
-        }
+    if (search_ret != ESP_OK) {
+        ESP_LOGE(TAG, "No DS18B20 found on 1-Wire bus");
+        return;
+    }
+
+    ds18b20_config_t ds_cfg = {};
+    ret = ds18b20_new_device_from_enumeration(&dev, &ds_cfg, &s_ds18b20);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DS18B20 device create failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    s_ow_ready = true;
+    ESP_LOGI(TAG, "DS18B20 ready on GPIO%d", PIN_SENSOR_WATER_TEMP_ONEWIRE);
+}
+
+/**
+ * @brief  Trigger a DS18B20 temperature conversion (non-blocking).
+ *
+ * Call at the END of a sampling cycle.  The result will be ready after
+ * DS18B20_CONVERSION_MS (750 ms for 12-bit), well within the next
+ * SENSOR_SAMPLE_INTERVAL_MS (1000 ms) cycle.
+ */
+static void ow_trigger_conversion(void)
+{
+    if (!s_ow_ready || s_ds18b20 == NULL) return;
+    esp_err_t ret = ds18b20_trigger_temperature_conversion(s_ds18b20);
+    if (ret == ESP_OK) {
+        s_ow_conversion_pending = true;
     } else {
-        mv = (avg_raw * 3300) / ADC_RAW_MAX;
+        ESP_LOGW(TAG, "DS18B20 conversion trigger failed: %s", esp_err_to_name(ret));
+        s_ow_conversion_pending = false;
     }
+}
 
-    *out_raw = (uint16_t)avg_raw;
-    *out_mv  = mv;
-    return ESP_OK;
+/**
+ * @brief  Read the result of the previously triggered conversion.
+ *
+ * Call at the START of a sampling cycle (after the previous cycle triggered).
+ * Returns ESP_ERR_INVALID_STATE if no conversion was pending.
+ */
+static esp_err_t sample_water_temp(float *temp_c)
+{
+    if (temp_c == NULL) return ESP_ERR_INVALID_ARG;
+    *temp_c = 0.0f;
+
+    if (!s_ow_ready || s_ds18b20 == NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_ow_conversion_pending)         return ESP_ERR_INVALID_STATE;
+
+    s_ow_conversion_pending = false;
+    return ds18b20_get_temperature(s_ds18b20, temp_c);
 }
 
 /* --------------------------------------------------------------------------
  * Calibration application
  * -------------------------------------------------------------------------- */
-
-/**
- * @brief  Apply a linear calibration to a raw ADC count and validate the result.
- *
- * Used by the water-temperature sensor (ADC-based).
- *
- * @param  cali      Calibration coefficients (may be invalid).
- * @param  raw       Averaged ADC counts.
- * @param  mv        Averaged voltage (mV).
- * @param  val_min   Minimum physically sane value.
- * @param  val_max   Maximum physically sane value.
- * @param  out       Populated reading struct.
- */
-static void apply_calibration_and_validate(const calibration_t *cali,
-                                           uint16_t raw, int mv,
-                                           float val_min, float val_max,
-                                           sensor_reading_t *out)
-{
-    out->raw   = raw;
-    out->value = 0.0f;
-    out->valid = false;
-
-    /* Gate 1: calibration must exist */
-    if (!cali->valid) return;
-
-    /* Gate 2: raw ADC must not be stuck at a rail */
-    if (adc_raw_is_stuck((int)raw)) return;
-
-    /* Apply linear model: value = slope * raw_counts + offset */
-    float computed = cali->slope * (float)raw + cali->offset;
-
-    /* Gate 3: result must be finite and within physical bounds */
-    if (!isfinite(computed))          return;
-    if (computed < val_min)           return;
-    if (computed > val_max)           return;
-
-    out->value = computed;
-    out->valid = true;
-}
 
 /**
  * @brief  Apply a linear calibration to a GPIO digital level and validate.
@@ -304,28 +317,8 @@ static void apply_gpio_calibration_and_validate(const calibration_t *cali,
 }
 
 /* --------------------------------------------------------------------------
- * Water temperature (unchanged from original implementation)
+ * Water temperature — stale ADC stub removed; DS18B20 implementation above.
  * -------------------------------------------------------------------------- */
-
-static float estimate_water_temp_celsius(int millivolts)
-{
-    /* Placeholder — replace with sensor-specific transfer function. */
-    return (float)millivolts / 10.0f;
-}
-
-static esp_err_t sample_water_temp(float *temp_c)
-{
-    if (temp_c == NULL) return ESP_ERR_INVALID_ARG;
-
-    uint16_t raw = 0;
-    int      mv  = 0;
-    if (adc_read_averaged(PIN_SENSOR_WATER_TEMP_ADC_CHANNEL, &raw, &mv) == ESP_OK) {
-        *temp_c = estimate_water_temp_celsius(mv);
-        return ESP_OK;
-    }
-    *temp_c = 0.0f;
-    return ESP_FAIL;
-}
 
 /* --------------------------------------------------------------------------
  * Topic building
@@ -390,43 +383,12 @@ static esp_err_t ensure_sensor_interfaces(void)
     ret = gpio_config(&ph_tds_cfg);
     if (ret != ESP_OK) return ret;
 
-    /* ADC unit (water temperature only) */
-    if (s_adc_handle == NULL) {
-        adc_oneshot_unit_init_cfg_t init_cfg = {
-            .unit_id  = PIN_SENSOR_WATER_TEMP_ADC_UNIT,
-            .ulp_mode = ADC_ULP_MODE_DISABLE,
-        };
-        ret = adc_oneshot_new_unit(&init_cfg, &s_adc_handle);
-        if (ret != ESP_OK) return ret;
+    /* DS18B20 1-Wire (water temperature) */
+    ow_init();
 
-        adc_oneshot_chan_cfg_t chan_cfg = {
-            .atten    = SENSOR_ADC_ATTEN,
-            .bitwidth = SENSOR_ADC_BITWIDTH,
-        };
-
-        /* Configure water-temperature ADC channel only */
-        ret = adc_oneshot_config_channel(s_adc_handle,
-                                         PIN_SENSOR_WATER_TEMP_ADC_CHANNEL,
-                                         &chan_cfg);
-        if (ret != ESP_OK) return ret;
-
-        /* Attempt hardware curve-fitting calibration */
-        adc_cali_curve_fitting_config_t cali_cfg = {
-            .unit_id  = PIN_SENSOR_WATER_TEMP_ADC_UNIT,
-            .chan     = PIN_SENSOR_WATER_TEMP_ADC_CHANNEL,
-            .atten    = SENSOR_ADC_ATTEN,
-            .bitwidth = SENSOR_ADC_BITWIDTH,
-        };
-        s_adc_cali = NULL;
-        if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali) == ESP_OK) {
-            s_adc_cali_ready = true;
-            ESP_LOGI(TAG, "ADC curve-fitting calibration enabled");
-        } else {
-            s_adc_cali_ready = false;
-            s_adc_cali = NULL;
-            ESP_LOGW(TAG, "ADC hardware calibration unavailable; using linear fallback");
-        }
-    }
+    /* Trigger the first conversion immediately so the very first
+     * sample_water_temp() call one cycle later has a result ready. */
+    ow_trigger_conversion();
 
     return ESP_OK;
 }
@@ -435,49 +397,93 @@ static esp_err_t ensure_sensor_interfaces(void)
  * MQTT calibration subscription
  * -------------------------------------------------------------------------- */
 
+static esp_err_t subscribe_one_with_retry(const char *topic,
+                                          mqtt_manager_message_cb_t cb,
+                                          const char *err_state_topic);
+
 static esp_err_t subscribe_calibration_topics(void)
 {
-    esp_err_t ret = mqtt_manager_subscribe(s_topics.cali_ph_set, 1,
-                                           on_cali_ph_set, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to subscribe to %s: %s",
-                 s_topics.cali_ph_set, esp_err_to_name(ret));
-        return ret;
-    }
+    esp_err_t ret = subscribe_one_with_retry(s_topics.cali_ph_set,
+                                             on_cali_ph_set,
+                                             s_topics.cali_ph_state);
+    if (ret != ESP_OK) return ret;
 
-    ret = mqtt_manager_subscribe(s_topics.cali_tds_set, 1,
-                                 on_cali_tds_set, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to subscribe to %s: %s",
-                 s_topics.cali_tds_set, esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "Subscribed to calibration set topics");
-    return ESP_OK;
+    return subscribe_one_with_retry(s_topics.cali_tds_set,
+                                    on_cali_tds_set,
+                                    s_topics.cali_tds_state);
 }
 
 /* --------------------------------------------------------------------------
  * JSON calibration payload publisher
  * -------------------------------------------------------------------------- */
 
-static void publish_cali_state(const char *topic, const calibration_t *c)
+/** Publish with retain, retrying up to CALI_PUB_RETRY_COUNT times. */
+static esp_err_t publish_retained_with_retry(const char *topic, const char *payload)
 {
-    char buf[160];
+    for (int attempt = 0; attempt <= CALI_PUB_RETRY_COUNT; attempt++) {
+        if (mqtt_manager_publish(topic, payload, /*qos=*/1, /*retain=*/1) == ESP_OK) {
+            return ESP_OK;
+        }
+        if (attempt < CALI_PUB_RETRY_COUNT) {
+            ESP_LOGW(TAG, "Publish to %s failed, retry %d/%d",
+                     topic, attempt + 1, CALI_PUB_RETRY_COUNT);
+            vTaskDelay(pdMS_TO_TICKS(CALI_PUB_RETRY_DELAY_MS));
+        }
+    }
+    ESP_LOGE(TAG, "Publish to %s failed after %d attempts", topic, CALI_PUB_RETRY_COUNT + 1);
+    return ESP_FAIL;
+}
+
+/**
+ * Publish a valid calibration state (4 dp, field order per Req 10).
+ * Also publishes valid=true to the sensor/<type>/valid topic.
+ */
+static void publish_cali_state(const char *state_topic,
+                               const char *valid_topic,
+                               const calibration_t *c)
+{
+    char buf[256];
     snprintf(buf, sizeof(buf),
              "{\"mode\":\"linear\","
-             "\"slope\":%.6f,"
-             "\"offset\":%.6f,"
-             "\"valid\":%s,"
+             "\"slope\":%.4f,"
+             "\"offset\":%.4f,"
+             "\"valid\":true,"
              "\"updated_at\":%lu}",
              (double)c->slope,
              (double)c->offset,
-             c->valid ? "true" : "false",
              (unsigned long)c->updated_at);
 
-    if (mqtt_manager_publish(topic, buf, /*qos=*/1, /*retain=*/1) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to publish calibration state to %s", topic);
-    }
+    publish_retained_with_retry(state_topic, buf);
+    publish_retained_with_retry(valid_topic, "true");
+}
+
+/**
+ * Publish an error calibration state (valid=false, reason field, Req 10.3).
+ * updated_at is taken from the current in-memory calibration (0 if never set).
+ */
+static void publish_cali_error(const char *state_topic,
+                               const char *valid_topic,
+                               uint32_t last_updated_at,
+                               const char *reason)
+{
+    char buf[256];
+    /* Truncate reason to 128 chars as required */
+    char safe_reason[129];
+    strncpy(safe_reason, reason, 128);
+    safe_reason[128] = '\0';
+
+    snprintf(buf, sizeof(buf),
+             "{\"mode\":\"linear\","
+             "\"slope\":0.0000,"
+             "\"offset\":0.0000,"
+             "\"valid\":false,"
+             "\"updated_at\":%lu,"
+             "\"reason\":\"%s\"}",
+             (unsigned long)last_updated_at,
+             safe_reason);
+
+    publish_retained_with_retry(state_topic, buf);
+    publish_retained_with_retry(valid_topic, "false");
 }
 
 /* --------------------------------------------------------------------------
@@ -518,41 +524,37 @@ static bool json_get_float(const char *json, const char *key, float *out)
     return true;
 }
 
-static bool json_get_uint32(const char *json, const char *key, uint32_t *out)
-{
-    char pattern[48];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-    const char *p = strstr(json, pattern);
-    if (p == NULL) return false;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == '\t') p++;
-    char *end = NULL;
-    unsigned long v = strtoul(p, &end, 10);
-    if (end == p) return false;
-    *out = (uint32_t)v;
-    return true;
-}
+/* --------------------------------------------------------------------------
+ * Calibration plausible-range descriptor
+ * -------------------------------------------------------------------------- */
 
-static bool json_get_bool(const char *json, const char *key, bool *out)
-{
-    char pattern[48];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-    const char *p = strstr(json, pattern);
-    if (p == NULL) return false;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == '\t') p++;
-    if (strncmp(p, "true",  4) == 0) { *out = true;  return true; }
-    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
-    return false;
-}
+typedef struct {
+    float slope_min, slope_max;
+    float offset_min, offset_max;
+} cali_plausible_range_t;
+
+static const cali_plausible_range_t k_ph_range = {
+    .slope_min  = PH_SLOPE_MIN,  .slope_max  = PH_SLOPE_MAX,
+    .offset_min = PH_OFFSET_MIN, .offset_max = PH_OFFSET_MAX,
+};
+
+static const cali_plausible_range_t k_tds_range = {
+    .slope_min  = TDS_SLOPE_MIN,  .slope_max  = TDS_SLOPE_MAX,
+    .offset_min = TDS_OFFSET_MIN, .offset_max = TDS_OFFSET_MAX,
+};
 
 /**
- * @brief  Parse a JSON calibration payload into a calibration_t.
+ * @brief  Validate a raw MQTT calibration payload against all Req-4 rules.
  *
- * @return true if all required fields were found and the mode is "linear".
+ * Stops at the first failing check and writes a human-readable reason into
+ * @p reason_out (max 128 chars including NUL).
+ *
+ * @return true if all checks pass; false with reason_out populated otherwise.
  */
-static bool parse_calibration_json(const char *payload, int payload_len,
-                                   calibration_t *out)
+static bool validate_cali_payload(const char *payload, int payload_len,
+                                  const cali_plausible_range_t *range,
+                                  calibration_t *out,
+                                  char *reason_out)
 {
     /* Work on a NUL-terminated copy */
     char buf[256];
@@ -561,20 +563,150 @@ static bool parse_calibration_json(const char *payload, int payload_len,
     memcpy(buf, payload, copy_len);
     buf[copy_len] = '\0';
 
-    /* Require mode = "linear" */
-    if (strstr(buf, "\"linear\"") == NULL) {
-        ESP_LOGW(TAG, "Calibration: unsupported mode (only 'linear' accepted)");
+    /* Req 4.1 — must be parseable JSON object (heuristic: starts with '{') */
+    const char *p = buf;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '{') {
+        snprintf(reason_out, 128, "payload is not a JSON object");
         return false;
     }
 
-    calibration_t c = {0};
-    if (!json_get_float(buf,   "slope",      &c.slope))      return false;
-    if (!json_get_float(buf,   "offset",     &c.offset))     return false;
-    if (!json_get_bool(buf,    "valid",      &c.valid))      return false;
-    if (!json_get_uint32(buf,  "updated_at", &c.updated_at)) return false;
+    /* Req 4.4 — mode must be "linear" */
+    if (strstr(buf, "\"mode\"") == NULL) {
+        snprintf(reason_out, 128, "missing field: mode");
+        return false;
+    }
+    if (strstr(buf, "\"linear\"") == NULL) {
+        snprintf(reason_out, 128, "unsupported mode (only linear accepted)");
+        return false;
+    }
 
-    *out = c;
+    /* Req 4.2 — slope must be present */
+    float slope = 0.0f;
+    if (!json_get_float(buf, "slope", &slope)) {
+        snprintf(reason_out, 128, "missing field: slope");
+        return false;
+    }
+
+    /* Req 4.2 — offset must be present */
+    float offset = 0.0f;
+    if (!json_get_float(buf, "offset", &offset)) {
+        snprintf(reason_out, 128, "missing field: offset");
+        return false;
+    }
+
+    /* Req 4.3 — slope and offset must be finite */
+    if (!isfinite(slope)) {
+        snprintf(reason_out, 128, "slope is not finite");
+        return false;
+    }
+    if (!isfinite(offset)) {
+        snprintf(reason_out, 128, "offset is not finite");
+        return false;
+    }
+
+    /* Req 4.3 — slope must be non-zero */
+    if (slope == 0.0f) {
+        snprintf(reason_out, 128, "slope must be non-zero");
+        return false;
+    }
+
+    /* Req 4.5/4.6 — plausible range check */
+    if (slope < range->slope_min || slope > range->slope_max) {
+        snprintf(reason_out, 128, "slope %.4f out of range [%.4f, %.4f]",
+                 (double)slope, (double)range->slope_min, (double)range->slope_max);
+        return false;
+    }
+    if (offset < range->offset_min || offset > range->offset_max) {
+        snprintf(reason_out, 128, "offset %.4f out of range [%.4f, %.4f]",
+                 (double)offset, (double)range->offset_min, (double)range->offset_max);
+        return false;
+    }
+
+    out->slope      = slope;
+    out->offset     = offset;
+    out->valid      = true;
+    out->updated_at = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     return true;
+}
+
+/**
+ * @brief  Orchestrate validate → NVS write (with retry) → readback → in-memory update.
+ *
+ * @param  payload        Raw MQTT payload bytes.
+ * @param  payload_len    Length of payload.
+ * @param  range          Plausible-range descriptor for this sensor type.
+ * @param  nvs_save       Function pointer to sensor_calibration_nvs_save_ph/tds.
+ * @param  nvs_verify     Function pointer to sensor_calibration_nvs_verify_ph/tds.
+ * @param  cali_mem       Pointer to the in-memory calibration_t to update on success.
+ * @param  state_topic    Topic for publishing calibration state / errors.
+ * @param  valid_topic    Topic for publishing sensor valid flag.
+ * @param  type_name      Human-readable type name for log messages.
+ */
+static void handle_cali_set(const char *payload, int payload_len,
+                             const cali_plausible_range_t *range,
+                             esp_err_t (*nvs_save)(const calibration_t *),
+                             esp_err_t (*nvs_verify)(float, float),
+                             calibration_t *cali_mem,
+                             const char *state_topic,
+                             const char *valid_topic,
+                             const char *type_name)
+{
+    /* Snapshot current updated_at for error messages before any change */
+    portENTER_CRITICAL(&s_cali_lock);
+    uint32_t prev_updated_at = cali_mem->updated_at;
+    portEXIT_CRITICAL(&s_cali_lock);
+
+    /* --- Req 4: Validate --- */
+    char reason[128] = {0};
+    calibration_t new_cali = {0};
+    if (!validate_cali_payload(payload, payload_len, range, &new_cali, reason)) {
+        ESP_LOGW(TAG, "%s calibration rejected: %s", type_name, reason);
+        publish_cali_error(state_topic, valid_topic, prev_updated_at, reason);
+        return;
+    }
+
+    /* --- Req 5: NVS write with retry --- */
+    esp_err_t save_ret = ESP_FAIL;
+    for (int attempt = 0; attempt <= CALI_NVS_RETRY_COUNT; attempt++) {
+        save_ret = nvs_save(&new_cali);
+        if (save_ret == ESP_OK) break;
+        ESP_LOGW(TAG, "%s NVS save failed (attempt %d/%d): %s",
+                 type_name, attempt + 1, CALI_NVS_RETRY_COUNT + 1,
+                 esp_err_to_name(save_ret));
+    }
+
+    if (save_ret != ESP_OK) {
+        snprintf(reason, sizeof(reason), "NVS write failed: %s",
+                 esp_err_to_name(save_ret));
+        publish_cali_error(state_topic, valid_topic, prev_updated_at, reason);
+        /* Req 5.3: keep old in-memory calibration unchanged */
+        return;
+    }
+
+    /* --- Req 8.4: Read-back verification --- */
+    esp_err_t verify_ret = nvs_verify(new_cali.slope, new_cali.offset);
+    if (verify_ret != ESP_OK) {
+        /* Req 8.1/8.2: treat as corruption — invalidate in-memory */
+        portENTER_CRITICAL(&s_cali_lock);
+        cali_mem->valid = false;
+        portEXIT_CRITICAL(&s_cali_lock);
+        snprintf(reason, sizeof(reason), "NVS read-back mismatch after write");
+        publish_cali_error(state_topic, valid_topic, prev_updated_at, reason);
+        return;
+    }
+
+    /* --- Success: update in-memory AFTER confirmed NVS write --- */
+    portENTER_CRITICAL(&s_cali_lock);
+    *cali_mem = new_cali;
+    portEXIT_CRITICAL(&s_cali_lock);
+
+    ESP_LOGI(TAG, "%s calibration updated: slope=%.4f offset=%.4f updated_at=%lu",
+             type_name, (double)new_cali.slope, (double)new_cali.offset,
+             (unsigned long)new_cali.updated_at);
+
+    /* --- Req 6: Publish state + valid flag --- */
+    publish_cali_state(state_topic, valid_topic, &new_cali);
 }
 
 /* --------------------------------------------------------------------------
@@ -586,25 +718,14 @@ static void on_cali_ph_set(const char *topic, const char *payload,
 {
     (void)topic;
     (void)user_ctx;
-
-    calibration_t new_cali = {0};
-    if (!parse_calibration_json(payload, payload_len, &new_cali)) {
-        ESP_LOGE(TAG, "pH calibration: failed to parse payload");
-        return;
-    }
-
-    portENTER_CRITICAL(&s_cali_lock);
-    s_ph_cali = new_cali;
-    portEXIT_CRITICAL(&s_cali_lock);
-
-    if (sensor_calibration_nvs_save_ph(&new_cali) != ESP_OK) {
-        ESP_LOGW(TAG, "pH calibration: NVS save failed");
-    }
-
-    ESP_LOGI(TAG, "pH calibration updated: slope=%.4f offset=%.4f valid=%d",
-             new_cali.slope, new_cali.offset, (int)new_cali.valid);
-
-    publish_cali_state(s_topics.cali_ph_state, &new_cali);
+    handle_cali_set(payload, payload_len,
+                    &k_ph_range,
+                    sensor_calibration_nvs_save_ph,
+                    sensor_calibration_nvs_verify_ph,
+                    &s_ph_cali,
+                    s_topics.cali_ph_state,
+                    s_topics.ph_valid,
+                    "pH");
 }
 
 static void on_cali_tds_set(const char *topic, const char *payload,
@@ -612,25 +733,89 @@ static void on_cali_tds_set(const char *topic, const char *payload,
 {
     (void)topic;
     (void)user_ctx;
+    handle_cali_set(payload, payload_len,
+                    &k_tds_range,
+                    sensor_calibration_nvs_save_tds,
+                    sensor_calibration_nvs_verify_tds,
+                    &s_tds_cali,
+                    s_topics.cali_tds_state,
+                    s_topics.tds_valid,
+                    "TDS");
+}
 
-    calibration_t new_cali = {0};
-    if (!parse_calibration_json(payload, payload_len, &new_cali)) {
-        ESP_LOGE(TAG, "TDS calibration: failed to parse payload");
-        return;
+/* --------------------------------------------------------------------------
+ * Subscription helper with retry (Req 3.4/3.5)
+ * -------------------------------------------------------------------------- */
+
+static esp_err_t subscribe_one_with_retry(const char *topic,
+                                          mqtt_manager_message_cb_t cb,
+                                          const char *err_state_topic)
+{
+    for (int attempt = 0; attempt <= CALI_SUB_RETRY_COUNT; attempt++) {
+        esp_err_t ret = mqtt_manager_subscribe(topic, 1, cb, NULL);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Subscribed to %s", topic);
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "Subscribe to %s failed (attempt %d/%d): %s",
+                 topic, attempt + 1, CALI_SUB_RETRY_COUNT + 1,
+                 esp_err_to_name(ret));
+        if (attempt < CALI_SUB_RETRY_COUNT) {
+            vTaskDelay(pdMS_TO_TICKS(CALI_SUB_RETRY_DELAY_MS));
+        }
     }
 
+    /* Req 3.5: publish error after all retries exhausted */
+    char reason[128];
+    snprintf(reason, sizeof(reason), "subscription failed for %s", topic);
+    /* Determine which valid topic to use based on which state topic this is */
+    bool is_ph = (strcmp(err_state_topic, s_topics.cali_ph_state) == 0);
+    const char *valid_topic = is_ph ? s_topics.ph_valid : s_topics.tds_valid;
     portENTER_CRITICAL(&s_cali_lock);
-    s_tds_cali = new_cali;
+    uint32_t upd = is_ph ? s_ph_cali.updated_at : s_tds_cali.updated_at;
+    portEXIT_CRITICAL(&s_cali_lock);
+    publish_cali_error(err_state_topic, valid_topic, upd, reason);
+    return ESP_FAIL;
+}
+
+/* --------------------------------------------------------------------------
+ * MQTT reconnect callback (Req 3.3 re-subscribe + Req 1.8 deferred publish)
+ * -------------------------------------------------------------------------- */
+
+static void on_mqtt_connected(bool connected, void *user_ctx)
+{
+    (void)user_ctx;
+    if (!connected) return;
+
+    /* Re-subscribe within 5 s — subscribe_one_with_retry uses 2 s delays,
+     * 3 retries = max 6 s, but first attempt is immediate so typical case
+     * is well within 5 s. */
+    subscribe_calibration_topics();
+
+    /* Deferred publish for boot-time calibration state (Req 1.8) */
+    portENTER_CRITICAL(&s_cali_lock);
+    bool ph_pending  = s_ph_pub_pending;
+    bool tds_pending = s_tds_pub_pending;
+    calibration_t ph_snap  = s_ph_cali;
+    calibration_t tds_snap = s_tds_cali;
+    s_ph_pub_pending  = false;
+    s_tds_pub_pending = false;
     portEXIT_CRITICAL(&s_cali_lock);
 
-    if (sensor_calibration_nvs_save_tds(&new_cali) != ESP_OK) {
-        ESP_LOGW(TAG, "TDS calibration: NVS save failed");
+    if (ph_pending) {
+        if (ph_snap.valid) {
+            publish_cali_state(s_topics.cali_ph_state, s_topics.ph_valid, &ph_snap);
+        } else {
+            publish_retained_with_retry(s_topics.ph_valid, "false");
+        }
     }
-
-    ESP_LOGI(TAG, "TDS calibration updated: slope=%.4f offset=%.4f valid=%d",
-             new_cali.slope, new_cali.offset, (int)new_cali.valid);
-
-    publish_cali_state(s_topics.cali_tds_state, &new_cali);
+    if (tds_pending) {
+        if (tds_snap.valid) {
+            publish_cali_state(s_topics.cali_tds_state, s_topics.tds_valid, &tds_snap);
+        } else {
+            publish_retained_with_retry(s_topics.tds_valid, "false");
+        }
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -657,39 +842,106 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
     /* Load calibration from NVS — sensors remain invalid until calibration
      * is loaded or received via MQTT */
     portENTER_CRITICAL(&s_cali_lock);
-    memset(&s_ph_cali,  0, sizeof(s_ph_cali));
-    memset(&s_tds_cali, 0, sizeof(s_tds_cali));
+    memset(&s_ph_cali,   0, sizeof(s_ph_cali));
+    memset(&s_tds_cali,  0, sizeof(s_tds_cali));
+    s_ph_pub_pending  = false;
+    s_tds_pub_pending = false;
     portEXIT_CRITICAL(&s_cali_lock);
 
-    bool found = false;
-    calibration_t loaded = {0};
+    /* Helper: load one sensor's calibration with plausible-range check */
+    struct {
+        esp_err_t (*load)(calibration_t *, bool *);
+        calibration_t        *mem;
+        bool                 *pub_pending;
+        const char           *state_topic;
+        const char           *valid_topic;
+        const cali_plausible_range_t *range;
+        const char           *name;
+    } sensors[] = {
+        { sensor_calibration_nvs_load_ph,  &s_ph_cali,  &s_ph_pub_pending,
+          s_topics.cali_ph_state,  s_topics.ph_valid,  &k_ph_range,  "pH"  },
+        { sensor_calibration_nvs_load_tds, &s_tds_cali, &s_tds_pub_pending,
+          s_topics.cali_tds_state, s_topics.tds_valid, &k_tds_range, "TDS" },
+    };
 
-    ret = sensor_calibration_nvs_load_ph(&loaded, &found);
-    if (ret == ESP_OK && found) {
-        portENTER_CRITICAL(&s_cali_lock);
-        s_ph_cali = loaded;
-        portEXIT_CRITICAL(&s_cali_lock);
-        ESP_LOGI(TAG, "pH calibration loaded from NVS: slope=%.4f offset=%.4f",
-                 loaded.slope, loaded.offset);
-    } else if (ret == ESP_OK) {
-        ESP_LOGW(TAG, "No pH calibration in NVS — sensor will be invalid until calibrated");
-    } else {
-        ESP_LOGE(TAG, "pH NVS load error: %s", esp_err_to_name(ret));
-    }
+    /* Register MQTT reconnect callback before checking connection state so a
+     * connect event that fires during the NVS load loop is not missed (Req 1.8). */
+    mqtt_manager_set_connection_cb(on_mqtt_connected, NULL);
 
-    memset(&loaded, 0, sizeof(loaded));
-    found = false;
-    ret = sensor_calibration_nvs_load_tds(&loaded, &found);
-    if (ret == ESP_OK && found) {
+    bool mqtt_up = mqtt_manager_is_connected();
+
+    for (int i = 0; i < 2; i++) {
+        bool found = false;
+        calibration_t loaded = {0};
+        esp_err_t load_ret = sensors[i].load(&loaded, &found);
+
+        if (load_ret != ESP_OK) {
+            /* Req 1.6: NVS read error — mark invalid */
+            ESP_LOGE(TAG, "%s NVS load error: %s",
+                     sensors[i].name, esp_err_to_name(load_ret));
+            if (mqtt_up) {
+                publish_retained_with_retry(sensors[i].valid_topic, "false");
+            } else {
+                *sensors[i].pub_pending = true;
+            }
+            continue;
+        }
+
+        if (!found) {
+            /* Req 1.4: no entry in NVS */
+            ESP_LOGW(TAG, "No %s calibration in NVS — sensor invalid until calibrated",
+                     sensors[i].name);
+            if (mqtt_up) {
+                publish_retained_with_retry(sensors[i].valid_topic, "false");
+            } else {
+                *sensors[i].pub_pending = true;
+            }
+            continue;
+        }
+
+        /* Req 1.7: plausible-range check on loaded data */
+        const cali_plausible_range_t *r = sensors[i].range;
+        bool in_range = (loaded.slope  >= r->slope_min  && loaded.slope  <= r->slope_max &&
+                         loaded.offset >= r->offset_min && loaded.offset <= r->offset_max);
+
+        if (!loaded.valid || !in_range) {
+            ESP_LOGW(TAG, "%s NVS calibration out of plausible range or invalid flag — discarding",
+                     sensors[i].name);
+            char reason[128];
+            if (!loaded.valid) {
+                snprintf(reason, sizeof(reason), "NVS valid flag is false");
+            } else {
+                snprintf(reason, sizeof(reason),
+                         "coefficients out of plausible range: slope=%.4f offset=%.4f",
+                         (double)loaded.slope, (double)loaded.offset);
+            }
+            if (mqtt_up) {
+                publish_cali_error(sensors[i].state_topic, sensors[i].valid_topic,
+                                   loaded.updated_at, reason);
+            } else {
+                *sensors[i].pub_pending = true;
+                /* Store the invalid-flagged copy so deferred publish has updated_at */
+                loaded.valid = false;
+                portENTER_CRITICAL(&s_cali_lock);
+                *sensors[i].mem = loaded;
+                portEXIT_CRITICAL(&s_cali_lock);
+            }
+            continue;
+        }
+
+        /* Req 1.2: valid calibration — apply to pipeline */
         portENTER_CRITICAL(&s_cali_lock);
-        s_tds_cali = loaded;
+        *sensors[i].mem = loaded;
         portEXIT_CRITICAL(&s_cali_lock);
-        ESP_LOGI(TAG, "TDS calibration loaded from NVS: slope=%.4f offset=%.4f",
-                 loaded.slope, loaded.offset);
-    } else if (ret == ESP_OK) {
-        ESP_LOGW(TAG, "No TDS calibration in NVS — sensor will be invalid until calibrated");
-    } else {
-        ESP_LOGE(TAG, "TDS NVS load error: %s", esp_err_to_name(ret));
+        ESP_LOGI(TAG, "%s calibration loaded from NVS: slope=%.4f offset=%.4f",
+                 sensors[i].name, (double)loaded.slope, (double)loaded.offset);
+
+        /* Req 1.3: publish state */
+        if (mqtt_up) {
+            publish_cali_state(sensors[i].state_topic, sensors[i].valid_topic, &loaded);
+        } else {
+            *sensors[i].pub_pending = true;
+        }
     }
 
     /* Subscribe to inbound calibration command topics */
@@ -706,16 +958,18 @@ esp_err_t sensor_telemetry_deinit(void)
     if (s_topics.cali_ph_set[0]  != '\0') mqtt_manager_unsubscribe(s_topics.cali_ph_set);
     if (s_topics.cali_tds_set[0] != '\0') mqtt_manager_unsubscribe(s_topics.cali_tds_set);
 
-    if (s_adc_cali != NULL) {
-        adc_cali_delete_scheme_curve_fitting(s_adc_cali);
-        s_adc_cali = NULL;
+    if (s_ds18b20 != NULL) {
+        ds18b20_del_device(s_ds18b20);
+        s_ds18b20 = NULL;
     }
-    s_adc_cali_ready = false;
 
-    if (s_adc_handle != NULL) {
-        adc_oneshot_del_unit(s_adc_handle);
-        s_adc_handle = NULL;
+    if (s_ow_bus != NULL) {
+        onewire_bus_del(s_ow_bus);
+        s_ow_bus = NULL;
     }
+
+    s_ow_ready              = false;
+    s_ow_conversion_pending = false;
 
     portENTER_CRITICAL(&s_snapshot_lock);
     reset_state_locked();
@@ -754,9 +1008,13 @@ esp_err_t sensor_telemetry_sample(void)
     /* ── Water level (digital) ─────────────────────────────────────────── */
     int water_level = gpio_get_level((gpio_num_t)PIN_SENSOR_WATER_LEVEL);
 
-    /* ── Water temperature ─────────────────────────────────────────────── */
+    /* ── Water temperature (DS18B20 1-Wire, trigger-then-read pattern) ── */
+    /* Read the result of the conversion triggered at the end of the         */
+    /* previous cycle, then immediately trigger the next conversion so it    */
+    /* is ready by the time this function is called again (~1000 ms later).  */
     float temp_c = 0.0f;
     (void)sample_water_temp(&temp_c);
+    ow_trigger_conversion();
 
     /* ── pH ────────────────────────────────────────────────────────────── */
     sensor_reading_t ph_reading = {0};
@@ -800,9 +1058,8 @@ esp_err_t sensor_telemetry_sample(void)
     s_snapshot.water_level = water_level ? 1 : 0;
     s_snapshot.water_temp  = average_window(s_temp_history, s_history_count);
 
-    /* Raw counts for pH/TDS are the GPIO level (0 or 1); for water-temp the
-     * averaged ADC value.  Node-RED sees the live value and any calibration
-     * fault promptly regardless of the sensor interface type. */
+    /* Raw counts for pH/TDS are the GPIO level (0 or 1). Water-temp is read
+     * via DS18B20 1-Wire and has no raw count in the snapshot. */
     s_snapshot.ph_raw   = ph_reading.raw;   /* GPIO level 0 or 1 */
     s_snapshot.ph       = average_window(s_ph_history, s_history_count);
     s_snapshot.ph_valid = ph_reading.valid;

@@ -41,4 +41,21 @@ esp_err_t sensor_calibration_nvs_load_ph(calibration_t *c, bool *found);
  */
 esp_err_t sensor_calibration_nvs_load_tds(calibration_t *c, bool *found);
 
+/**
+ * @brief  Read back pH calibration from NVS and compare to expected values.
+ *
+ * Used after a write to detect NVS corruption.
+ *
+ * @param  expected_slope   The slope value just written.
+ * @param  expected_offset  The offset value just written.
+ * @return ESP_OK if read-back matches; ESP_ERR_INVALID_STATE on mismatch;
+ *         propagated NVS error on I/O failure.
+ */
+esp_err_t sensor_calibration_nvs_verify_ph(float expected_slope, float expected_offset);
+
+/**
+ * @brief  Read back TDS calibration from NVS and compare to expected values.
+ */
+esp_err_t sensor_calibration_nvs_verify_tds(float expected_slope, float expected_offset);
+
 #endif /* SENSOR_CALIBRATION_NVS_H */

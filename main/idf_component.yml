@@ -1,0 +1,6 @@
+## IDF Component Manager manifest for the main component
+dependencies:
+  espressif/onewire_bus:
+    version: ">=0.1.0"
+  espressif/ds18b20:
+    version: ">=0.1.0"

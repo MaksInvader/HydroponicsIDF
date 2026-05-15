@@ -9,9 +9,11 @@ idf_component_register(
         "zone_config.c"
         "setup_config.c"
         "actuator_control.c"
+        "indicator_led.c"
         "sensor_telemetry.c"
         "sensor_calibration_nvs.c"
         "runtime_tasks.c"
+        "runtime_safety.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -26,4 +28,6 @@ idf_component_register(
         esp-tls
         driver
         esp_adc
+        onewire_bus
+        ds18b20
 )

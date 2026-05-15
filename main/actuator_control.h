@@ -14,7 +14,7 @@ typedef struct {
 	bool state_on;
 } actuator_last_command_t;
 
-#define ACTUATOR_CHANNEL_COUNT 5
+#define ACTUATOR_CHANNEL_COUNT 9
 
 typedef enum {
 	ACTUATOR_CHANNEL_VALVE = 0,
@@ -22,6 +22,10 @@ typedef enum {
 	ACTUATOR_CHANNEL_PER_NUTB,
 	ACTUATOR_CHANNEL_PER_PH_UP,
 	ACTUATOR_CHANNEL_PER_PH_DOWN,
+	ACTUATOR_CHANNEL_RELAY_1,
+	ACTUATOR_CHANNEL_RELAY_2,
+	ACTUATOR_CHANNEL_RELAY_3,
+	ACTUATOR_CHANNEL_RELAY_4,
 } actuator_channel_t;
 
 typedef enum {

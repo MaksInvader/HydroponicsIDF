@@ -1,0 +1,32 @@
+dependencies:
+  espressif/ds18b20:
+    component_hash: 13c5310b993bda17bd507b2c25cacce6962fe092029a5232815814d40339cec0
+    dependencies:
+    - name: espressif/onewire_bus
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.1.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.3.1
+  espressif/onewire_bus:
+    component_hash: a85dc1ceb71fb87af77c57d5fd4e6f48a504de1fc2b83fc302ec0cea331d05ce
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.1
+  idf:
+    source:
+      type: idf
+    version: 5.5.3
+direct_dependencies:
+- espressif/ds18b20
+- espressif/onewire_bus
+manifest_hash: 406e8c72d88c71ebfdf43a3564b1b191d6abea21012e67ade36b3f09f16dd151
+target: esp32s3
+version: 2.0.0

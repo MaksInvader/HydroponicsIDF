@@ -24,9 +24,9 @@
 #define SAFETY_MAX_DOSE_PH_UP_MS 15000
 #define SAFETY_MAX_DOSE_PH_DOWN_MS 15000
 
-/* Water level / fill behavior */
-#define SAFETY_LEVEL_LOW_DEBOUNCE_MS 300
-#define SAFETY_FILL_TIMEOUT_MS 45000
+/* Valve ON timeout — server is responsible for closing the valve.
+ * If the valve remains ON longer than this, a fill-timeout fault is latched. */
+#define SAFETY_FILL_TIMEOUT_MS          120000 /* 2 minutes */
 
 /* Temperature checks (Celsius) */
 #define SAFETY_TEMP_LOW 10.0f

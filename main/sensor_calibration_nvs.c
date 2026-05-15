@@ -1,3 +1,4 @@
+#include <math.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -162,4 +163,61 @@ esp_err_t sensor_calibration_nvs_load_tds(calibration_t *c, bool *found)
 {
     return load_calibration(KEY_TDS_SLOPE, KEY_TDS_OFFSET,
                             KEY_TDS_VALID, KEY_TDS_UPD_AT, c, found);
+}
+
+/* --------------------------------------------------------------------------
+ * Read-back verification (post-write integrity check)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Read back slope and offset for a sensor type and compare to expected values.
+ * A mismatch of more than 0.00005 in either field is treated as corruption.
+ */
+static esp_err_t verify_calibration(const char *slope_key,
+                                    const char *offset_key,
+                                    float expected_slope,
+                                    float expected_offset)
+{
+    nvs_handle_t h;
+    esp_err_t ret = nvs_open(CALI_NVS_NAMESPACE, NVS_READONLY, &h);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "verify: nvs_open failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    float rb_slope = 0.0f, rb_offset = 0.0f;
+    ret = nvs_get_float(h, slope_key,  &rb_slope);
+    if (ret == ESP_OK) ret = nvs_get_float(h, offset_key, &rb_offset);
+    nvs_close(h);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "verify: read-back failed (%s): %s",
+                 slope_key, esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Half-ULP of 4 decimal places = 0.00005 */
+    if (fabsf(rb_slope  - expected_slope)  > 0.00005f ||
+        fabsf(rb_offset - expected_offset) > 0.00005f) {
+        ESP_LOGE(TAG, "verify: mismatch on %s — "
+                 "expected slope=%.4f offset=%.4f, got slope=%.4f offset=%.4f",
+                 slope_key,
+                 (double)expected_slope,  (double)expected_offset,
+                 (double)rb_slope,        (double)rb_offset);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t sensor_calibration_nvs_verify_ph(float expected_slope, float expected_offset)
+{
+    return verify_calibration(KEY_PH_SLOPE, KEY_PH_OFFSET,
+                              expected_slope, expected_offset);
+}
+
+esp_err_t sensor_calibration_nvs_verify_tds(float expected_slope, float expected_offset)
+{
+    return verify_calibration(KEY_TDS_SLOPE, KEY_TDS_OFFSET,
+                              expected_slope, expected_offset);
 }

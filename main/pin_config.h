@@ -2,7 +2,6 @@
 #define PIN_CONFIG_H
 
 #include "driver/i2c.h"
-#include "esp_adc/adc_oneshot.h"
 
 /* Actuator output pins */
 #define PIN_ACTUATOR_VALVE        12
@@ -11,10 +10,22 @@
 #define PIN_ACTUATOR_PER_PH_UP    17
 #define PIN_ACTUATOR_PER_PH_DOWN  18
 
+/* Relay output pins (generic, server-controlled) */
+#define PIN_RELAY_1               19
+#define PIN_RELAY_2               20
+#define PIN_RELAY_3               21
+#define PIN_RELAY_4               38
+
+/* Status / indicator LEDs */
+#define PIN_LED_CONNECTION        39   /* HIGH = broker connected */
+#define PIN_LED_FAULT             40   /* HIGH = fault or emergency active */
+
+/* Reserved binary output */
+#define PIN_RESERVE_BINARY        41
+
 /* Sensor pins */
 #define PIN_SENSOR_WATER_LEVEL             1
-#define PIN_SENSOR_WATER_TEMP_ADC_UNIT     ADC_UNIT_1
-#define PIN_SENSOR_WATER_TEMP_ADC_CHANNEL  ADC_CHANNEL_3 /* GPIO4 on ESP32-S3 */
+#define PIN_SENSOR_WATER_TEMP_ONEWIRE      4   /* GPIO4 — DS18B20 1-Wire data line */
 
 /* pH and TDS sensors — direct GPIO digital output (not ADC).
  * Set these to the GPIO numbers your modules are wired to. */

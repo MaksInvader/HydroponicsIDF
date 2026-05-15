@@ -14,7 +14,7 @@
 #include "pin_config.h"
 
 #define ACTUATOR_TOPIC_LEN_MAX 96
-#define ACTUATOR_MAX_PULSE_MS 10000U
+#define ACTUATOR_MAX_PULSE_MS 60000U
 
 typedef struct {
     const char *name;
@@ -31,14 +31,22 @@ static const int s_gpio_list[] = {
     PIN_ACTUATOR_PER_NUTB,
     PIN_ACTUATOR_PER_PH_UP,
     PIN_ACTUATOR_PER_PH_DOWN,
+    PIN_RELAY_1,
+    PIN_RELAY_2,
+    PIN_RELAY_3,
+    PIN_RELAY_4,
 };
 
 static actuator_entry_t s_actuators[] = {
-    {.name = "valve", .gpio = PIN_ACTUATOR_VALVE},
-    {.name = "PerNutA", .gpio = PIN_ACTUATOR_PER_NUTA},
-    {.name = "PerNutB", .gpio = PIN_ACTUATOR_PER_NUTB},
-    {.name = "PerpHUp", .gpio = PIN_ACTUATOR_PER_PH_UP},
+    {.name = "valve",     .gpio = PIN_ACTUATOR_VALVE},
+    {.name = "PerNutA",   .gpio = PIN_ACTUATOR_PER_NUTA},
+    {.name = "PerNutB",   .gpio = PIN_ACTUATOR_PER_NUTB},
+    {.name = "PerpHUp",   .gpio = PIN_ACTUATOR_PER_PH_UP},
     {.name = "PerpHDown", .gpio = PIN_ACTUATOR_PER_PH_DOWN},
+    {.name = "relay1",    .gpio = PIN_RELAY_1},
+    {.name = "relay2",    .gpio = PIN_RELAY_2},
+    {.name = "relay3",    .gpio = PIN_RELAY_3},
+    {.name = "relay4",    .gpio = PIN_RELAY_4},
 };
 
 static bool s_initialized;
@@ -70,7 +78,7 @@ static void init_last_command_entry(actuator_last_command_t *entry, const actuat
 
 static bool is_valid_channel(actuator_channel_t channel)
 {
-    return channel >= ACTUATOR_CHANNEL_VALVE && channel <= ACTUATOR_CHANNEL_PER_PH_DOWN;
+    return channel >= ACTUATOR_CHANNEL_VALVE && channel <= ACTUATOR_CHANNEL_RELAY_4;
 }
 
 static const actuator_entry_t *entry_for_channel(actuator_channel_t channel)
