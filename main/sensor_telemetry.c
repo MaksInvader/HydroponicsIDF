@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "esp_log.h"
 #include "onewire_bus.h"
 #include "ds18b20.h"
@@ -133,6 +134,9 @@ static bool                       s_ow_ready  = false;
 /* true after the first conversion trigger; read is deferred to next cycle */
 static bool                       s_ow_conversion_pending = false;
 static bool                       s_initialized;
+
+/* ADS1115 I2C handle state */
+static bool s_ads1115_ready = false;
 
 static portMUX_TYPE               s_snapshot_lock  = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE               s_cali_lock      = portMUX_INITIALIZER_UNLOCKED;
@@ -276,36 +280,152 @@ static esp_err_t sample_water_temp(float *temp_c)
 }
 
 /* --------------------------------------------------------------------------
+ * ADS1115 I2C driver (minimal, single-shot)
+ * -------------------------------------------------------------------------- */
+
+/* ADS1115 register addresses */
+#define ADS1115_REG_CONVERSION  0x00
+#define ADS1115_REG_CONFIG      0x01
+
+/* Config register bits */
+#define ADS1115_OS_SINGLE       (1u << 15)  /* start single conversion      */
+#define ADS1115_MUX_AIN0_GND   (4u << 12)  /* AIN0 vs GND                  */
+#define ADS1115_MUX_AIN1_GND   (5u << 12)  /* AIN1 vs GND                  */
+#define ADS1115_PGA_4096        (1u << 9)   /* ±4.096 V FSR                 */
+#define ADS1115_MODE_SINGLE     (1u << 8)   /* single-shot mode             */
+#define ADS1115_DR_128SPS       (4u << 5)   /* 128 samples/s                */
+#define ADS1115_COMP_DISABLE    (3u << 0)   /* disable comparator           */
+
+#define ADS1115_CONVERSION_MS   10          /* ~8 ms at 128 SPS + margin    */
+
+/**
+ * @brief  Initialise the I2C master for the ADS1115.
+ *
+ * Shares I2C_NUM_0 with the LCD.  If the driver is already installed
+ * (ESP_ERR_INVALID_STATE) that is treated as success.
+ */
+static esp_err_t ads1115_init(void)
+{
+    i2c_config_t conf = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = PIN_ADS1115_I2C_SDA,
+        .scl_io_num       = PIN_ADS1115_I2C_SCL,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+        .clk_flags        = 0,
+    };
+    esp_err_t ret = i2c_param_config(PIN_ADS1115_I2C_PORT, &conf);
+    if (ret != ESP_OK) return ret;
+
+    ret = i2c_driver_install(PIN_ADS1115_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret == ESP_ERR_INVALID_STATE || ret == ESP_FAIL) {
+        /* Legacy i2c driver returns ESP_FAIL (not ESP_ERR_INVALID_STATE)
+         * when the driver is already installed on this port. Treat both as
+         * "already installed" and continue — the driver is usable. */
+        ret = ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADS1115 I2C driver install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Probe: write config register with a benign value */
+    uint16_t cfg = ADS1115_MUX_AIN0_GND | ADS1115_PGA_4096 |
+                   ADS1115_MODE_SINGLE   | ADS1115_DR_128SPS |
+                   ADS1115_COMP_DISABLE;
+    uint8_t buf[3] = {
+        ADS1115_REG_CONFIG,
+        (uint8_t)(cfg >> 8),
+        (uint8_t)(cfg & 0xFF),
+    };
+    ret = i2c_master_write_to_device(PIN_ADS1115_I2C_PORT, PIN_ADS1115_I2C_ADDR,
+                                     buf, sizeof(buf), pdMS_TO_TICKS(50));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADS1115 not found at 0x%02X: %s",
+                 PIN_ADS1115_I2C_ADDR, esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_ads1115_ready = true;
+    ESP_LOGI(TAG, "ADS1115 ready at I2C addr 0x%02X", PIN_ADS1115_I2C_ADDR);
+    return ESP_OK;
+}
+
+/**
+ * @brief  Perform a single-shot conversion on the given mux setting.
+ *
+ * @param  mux_bits  ADS1115_MUX_AIN0_GND or ADS1115_MUX_AIN1_GND
+ * @param  out_raw   Raw 16-bit signed result (0–32767 for single-ended).
+ * @return ESP_OK on success.
+ */
+static esp_err_t ads1115_read_channel(uint16_t mux_bits, int *out_raw)
+{
+    if (!s_ads1115_ready || out_raw == NULL) return ESP_ERR_INVALID_STATE;
+
+    /* Write config: start single-shot conversion on requested channel */
+    uint16_t cfg = ADS1115_OS_SINGLE | mux_bits | ADS1115_PGA_4096 |
+                   ADS1115_MODE_SINGLE | ADS1115_DR_128SPS |
+                   ADS1115_COMP_DISABLE;
+    uint8_t wr[3] = {
+        ADS1115_REG_CONFIG,
+        (uint8_t)(cfg >> 8),
+        (uint8_t)(cfg & 0xFF),
+    };
+    esp_err_t ret = i2c_master_write_to_device(PIN_ADS1115_I2C_PORT,
+                                               PIN_ADS1115_I2C_ADDR,
+                                               wr, sizeof(wr),
+                                               pdMS_TO_TICKS(50));
+    if (ret != ESP_OK) return ret;
+
+    /* Wait for conversion to complete */
+    vTaskDelay(pdMS_TO_TICKS(ADS1115_CONVERSION_MS));
+
+    /* Point to conversion register */
+    uint8_t reg = ADS1115_REG_CONVERSION;
+    uint8_t rd[2] = {0};
+    ret = i2c_master_write_read_device(PIN_ADS1115_I2C_PORT,
+                                       PIN_ADS1115_I2C_ADDR,
+                                       &reg, 1, rd, 2,
+                                       pdMS_TO_TICKS(50));
+    if (ret != ESP_OK) return ret;
+
+    int16_t raw = (int16_t)((rd[0] << 8) | rd[1]);
+    /* Single-ended: clamp negatives to 0 */
+    *out_raw = (raw < 0) ? 0 : (int)raw;
+    return ESP_OK;
+}
+
+/* --------------------------------------------------------------------------
  * Calibration application
  * -------------------------------------------------------------------------- */
 
 /**
- * @brief  Apply a linear calibration to a GPIO digital level and validate.
+ * @brief  Apply a linear calibration to an ADC raw count and validate.
  *
- * Used by pH and TDS sensors that output a direct digital signal on a GPIO pin.
- * The linear model maps the 0/1 level to a physical value via the stored
- * slope/offset coefficients (e.g. slope=14.0, offset=0.0 maps HIGH→14 pH).
+ * The linear model maps the raw ADC count to a physical value via the stored
+ * slope/offset coefficients: value = slope * raw + offset.
  *
  * @param  cali      Calibration coefficients (may be invalid).
- * @param  gpio_level  Raw GPIO level read via gpio_get_level() (0 or 1).
+ * @param  adc_raw   Raw ADC reading (0–4095 for 12-bit).
  * @param  val_min   Minimum physically sane value.
  * @param  val_max   Maximum physically sane value.
  * @param  out       Populated reading struct.
  */
-static void apply_gpio_calibration_and_validate(const calibration_t *cali,
-                                                int gpio_level,
-                                                float val_min, float val_max,
-                                                sensor_reading_t *out)
+static void apply_adc_calibration_and_validate(const calibration_t *cali,
+                                               int adc_raw,
+                                               float val_min, float val_max,
+                                               sensor_reading_t *out)
 {
-    out->raw   = (uint16_t)gpio_level;
+    out->raw   = (uint16_t)adc_raw;
     out->value = 0.0f;
     out->valid = false;
 
     /* Gate 1: calibration must exist */
     if (!cali->valid) return;
 
-    /* Apply linear model: value = slope * gpio_level + offset */
-    float computed = cali->slope * (float)gpio_level + cali->offset;
+    /* Apply linear model: value = slope * adc_raw + offset */
+    float computed = cali->slope * (float)adc_raw + cali->offset;
 
     /* Gate 2: result must be finite and within physical bounds */
     if (!isfinite(computed)) return;
@@ -372,16 +492,12 @@ static esp_err_t ensure_sensor_interfaces(void)
     esp_err_t ret = gpio_config(&level_cfg);
     if (ret != ESP_OK) return ret;
 
-    /* pH and TDS digital inputs (direct GPIO, not ADC) */
-    gpio_config_t ph_tds_cfg = {
-        .pin_bit_mask = (1ULL << PIN_SENSOR_PH) | (1ULL << PIN_SENSOR_TDS),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ret = gpio_config(&ph_tds_cfg);
-    if (ret != ESP_OK) return ret;
+    /* pH and TDS — ADS1115 16-bit ADC over I2C */
+    ret = ads1115_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADS1115 init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     /* DS18B20 1-Wire (water temperature) */
     ow_init();
@@ -411,6 +527,26 @@ static esp_err_t subscribe_calibration_topics(void)
     return subscribe_one_with_retry(s_topics.cali_tds_set,
                                     on_cali_tds_set,
                                     s_topics.cali_tds_state);
+}
+
+/**
+ * Single-attempt (no vTaskDelay) subscribe — safe to call from the MQTT
+ * event task where blocking is forbidden.
+ */
+static void subscribe_calibration_topics_nowait(void)
+{
+    esp_err_t ret = mqtt_manager_subscribe(s_topics.cali_ph_set, 1,
+                                           on_cali_ph_set, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "pH cali subscribe failed on connect: %s — will retry next reconnect",
+                 esp_err_to_name(ret));
+    }
+    ret = mqtt_manager_subscribe(s_topics.cali_tds_set, 1,
+                                 on_cali_tds_set, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "TDS cali subscribe failed on connect: %s — will retry next reconnect",
+                 esp_err_to_name(ret));
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -787,10 +923,10 @@ static void on_mqtt_connected(bool connected, void *user_ctx)
     (void)user_ctx;
     if (!connected) return;
 
-    /* Re-subscribe within 5 s — subscribe_one_with_retry uses 2 s delays,
-     * 3 retries = max 6 s, but first attempt is immediate so typical case
-     * is well within 5 s. */
-    subscribe_calibration_topics();
+    /* Re-subscribe using the no-wait variant — this callback runs on the
+     * MQTT event task and must never call vTaskDelay. A single attempt is
+     * sufficient because the broker just confirmed the connection. */
+    subscribe_calibration_topics_nowait();
 
     /* Deferred publish for boot-time calibration state (Req 1.8) */
     portENTER_CRITICAL(&s_cali_lock);
@@ -865,8 +1001,9 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
     };
 
     /* Register MQTT reconnect callback before checking connection state so a
-     * connect event that fires during the NVS load loop is not missed (Req 1.8). */
-    mqtt_manager_set_connection_cb(on_mqtt_connected, NULL);
+     * connect event that fires during the NVS load loop is not missed (Req 1.8).
+     * Uses add_connection_cb so it does not overwrite runtime_tasks' callback. */
+    mqtt_manager_add_connection_cb(on_mqtt_connected, NULL);
 
     bool mqtt_up = mqtt_manager_is_connected();
 
@@ -944,9 +1081,17 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
         }
     }
 
-    /* Subscribe to inbound calibration command topics */
-    ret = subscribe_calibration_topics();
-    if (ret != ESP_OK) return ret;
+    /* Subscribe to inbound calibration command topics.
+     * If MQTT is not connected yet this will fail — that is non-fatal because
+     * on_mqtt_connected() calls subscribe_calibration_topics() on every
+     * connect event, so the subscription will be established then. */
+    if (mqtt_manager_is_connected()) {
+        ret = subscribe_calibration_topics();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Calibration subscribe failed at init (%s) — will retry on reconnect",
+                     esp_err_to_name(ret));
+        }
+    }
 
     s_initialized = true;
     ESP_LOGI(TAG, "Sensor telemetry initialized for zone: %s", zone_id);
@@ -955,8 +1100,11 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
 
 esp_err_t sensor_telemetry_deinit(void)
 {
+    mqtt_manager_remove_connection_cb(on_mqtt_connected);
     if (s_topics.cali_ph_set[0]  != '\0') mqtt_manager_unsubscribe(s_topics.cali_ph_set);
     if (s_topics.cali_tds_set[0] != '\0') mqtt_manager_unsubscribe(s_topics.cali_tds_set);
+
+    s_ads1115_ready = false;
 
     if (s_ds18b20 != NULL) {
         ds18b20_del_device(s_ds18b20);
@@ -1026,28 +1174,44 @@ esp_err_t sensor_telemetry_sample(void)
     portEXIT_CRITICAL(&s_cali_lock);
 
     {
-        int ph_level = gpio_get_level((gpio_num_t)PIN_SENSOR_PH);
-        apply_gpio_calibration_and_validate(&ph_cali, ph_level,
-                                            PH_VALUE_MIN, PH_VALUE_MAX,
-                                            &ph_reading);
+        int ph_raw = 0;
+        esp_err_t adc_ret = ads1115_read_channel(ADS1115_MUX_AIN0_GND, &ph_raw);
+        if (adc_ret != ESP_OK) {
+            ESP_LOGW(TAG, "pH ADS1115 read failed: %s", esp_err_to_name(adc_ret));
+            ph_raw = 0;
+        }
+        apply_adc_calibration_and_validate(&ph_cali, ph_raw,
+                                           PH_VALUE_MIN, PH_VALUE_MAX,
+                                           &ph_reading);
     }
 
     /* ── TDS ───────────────────────────────────────────────────────────── */
     sensor_reading_t tds_reading = {0};
 
     {
-        int tds_level = gpio_get_level((gpio_num_t)PIN_SENSOR_TDS);
-        apply_gpio_calibration_and_validate(&tds_cali, tds_level,
-                                            TDS_VALUE_MIN, TDS_VALUE_MAX,
-                                            &tds_reading);
+        int tds_raw = 0;
+        esp_err_t adc_ret = ads1115_read_channel(ADS1115_MUX_AIN1_GND, &tds_raw);
+        if (adc_ret != ESP_OK) {
+            ESP_LOGW(TAG, "TDS ADS1115 read failed: %s", esp_err_to_name(adc_ret));
+            tds_raw = 0;
+        }
+        apply_adc_calibration_and_validate(&tds_cali, tds_raw,
+                                           TDS_VALUE_MIN, TDS_VALUE_MAX,
+                                           &tds_reading);
     }
 
     /* ── Update rolling history & snapshot ────────────────────────────── */
     portENTER_CRITICAL(&s_snapshot_lock);
 
     s_temp_history[s_history_index] = temp_c;
-    s_ph_history[s_history_index]   = ph_reading.value;
-    s_tds_history[s_history_index]  = tds_reading.value;
+    /* Only record calibrated values; skip invalid readings so history
+     * averages are never polluted with uncalibrated zeros. */
+    if (ph_reading.valid) {
+        s_ph_history[s_history_index]  = ph_reading.value;
+    }
+    if (tds_reading.valid) {
+        s_tds_history[s_history_index] = tds_reading.value;
+    }
 
     if (s_history_count < SENSOR_SAMPLE_WINDOW) {
         s_history_count++;

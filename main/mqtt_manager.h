@@ -15,6 +15,8 @@ esp_err_t mqtt_manager_publish(const char *topic, const char *payload, int qos, 
 esp_err_t mqtt_manager_subscribe(const char *topic, int qos, mqtt_manager_message_cb_t cb, void *user_ctx);
 esp_err_t mqtt_manager_unsubscribe(const char *topic);
 esp_err_t mqtt_manager_set_connection_cb(mqtt_manager_connection_cb_t cb, void *user_ctx);
+esp_err_t mqtt_manager_add_connection_cb(mqtt_manager_connection_cb_t cb, void *user_ctx);
+esp_err_t mqtt_manager_remove_connection_cb(mqtt_manager_connection_cb_t cb);
 uint32_t mqtt_manager_get_lock_timeout_count(void);
 bool mqtt_manager_is_connected(void);
 

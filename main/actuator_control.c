@@ -25,6 +25,7 @@ typedef struct {
 
 static const char *TAG = "actuator_ctrl";
 
+/* GPIOs driven LOW on init and deinit — excludes CIRCULATION_PUMP */
 static const int s_gpio_list[] = {
     PIN_ACTUATOR_VALVE,
     PIN_ACTUATOR_PER_NUTA,
@@ -38,15 +39,16 @@ static const int s_gpio_list[] = {
 };
 
 static actuator_entry_t s_actuators[] = {
-    {.name = "valve",     .gpio = PIN_ACTUATOR_VALVE},
-    {.name = "PerNutA",   .gpio = PIN_ACTUATOR_PER_NUTA},
-    {.name = "PerNutB",   .gpio = PIN_ACTUATOR_PER_NUTB},
-    {.name = "PerpHUp",   .gpio = PIN_ACTUATOR_PER_PH_UP},
-    {.name = "PerpHDown", .gpio = PIN_ACTUATOR_PER_PH_DOWN},
-    {.name = "relay1",    .gpio = PIN_RELAY_1},
-    {.name = "relay2",    .gpio = PIN_RELAY_2},
-    {.name = "relay3",    .gpio = PIN_RELAY_3},
-    {.name = "relay4",    .gpio = PIN_RELAY_4},
+    {.name = "valve",            .gpio = PIN_ACTUATOR_VALVE},
+    {.name = "PerNutA",          .gpio = PIN_ACTUATOR_PER_NUTA},
+    {.name = "PerNutB",          .gpio = PIN_ACTUATOR_PER_NUTB},
+    {.name = "PerPHUp",          .gpio = PIN_ACTUATOR_PER_PH_UP},
+    {.name = "PerPHDown",        .gpio = PIN_ACTUATOR_PER_PH_DOWN},
+    {.name = "relay1",           .gpio = PIN_RELAY_1},
+    {.name = "relay2",           .gpio = PIN_RELAY_2},
+    {.name = "relay3",           .gpio = PIN_RELAY_3},
+    {.name = "relay4",           .gpio = PIN_RELAY_4},
+    {.name = "CirculationPump",  .gpio = PIN_CIRCULATION_PUMP},
 };
 
 static bool s_initialized;
@@ -78,7 +80,7 @@ static void init_last_command_entry(actuator_last_command_t *entry, const actuat
 
 static bool is_valid_channel(actuator_channel_t channel)
 {
-    return channel >= ACTUATOR_CHANNEL_VALVE && channel <= ACTUATOR_CHANNEL_RELAY_4;
+    return channel >= ACTUATOR_CHANNEL_VALVE && channel <= ACTUATOR_CHANNEL_CIRCULATION_PUMP;
 }
 
 static const actuator_entry_t *entry_for_channel(actuator_channel_t channel)
@@ -147,6 +149,18 @@ static esp_err_t init_gpios_once(void)
     }
 
     s_initialized = true;
+
+    /* Circulation pump is always ON — configure and drive HIGH immediately */
+    gpio_config_t pump_cfg = {
+        .pin_bit_mask = (1ULL << PIN_CIRCULATION_PUMP),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pump_cfg);
+    gpio_set_level((gpio_num_t)PIN_CIRCULATION_PUMP, 1);
+
     return ESP_OK;
 }
 
@@ -179,6 +193,11 @@ static esp_err_t bind_actuator_topics(const char *zone_id)
         portENTER_CRITICAL(&s_state_lock);
         init_last_command_entry(&s_last_commands[i], &s_actuators[i], "OFF", false);
         portEXIT_CRITICAL(&s_state_lock);
+
+        /* Circulation pump stays HIGH always — skip init LOW and OFF publish */
+        if ((actuator_channel_t)i == ACTUATOR_CHANNEL_CIRCULATION_PUMP) {
+            continue;
+        }
 
         gpio_set_level((gpio_num_t)s_actuators[i].gpio, 0);
         esp_err_t ret = publish_status(&s_actuators[i], false);
@@ -220,6 +239,8 @@ esp_err_t actuator_control_deinit(void)
     for (size_t i = 0; i < sizeof(s_gpio_list) / sizeof(s_gpio_list[0]); i++) {
         gpio_set_level((gpio_num_t)s_gpio_list[i], 0);
     }
+    /* Circulation pump intentionally kept HIGH during deinit */
+    gpio_set_level((gpio_num_t)PIN_CIRCULATION_PUMP, 1);
 
     s_topics_bound = false;
     ESP_LOGI(TAG, "Actuator control deinitialized");
@@ -231,6 +252,11 @@ esp_err_t actuator_control_apply_state(actuator_channel_t channel, bool is_on)
     const actuator_entry_t *actuator = entry_for_channel(channel);
     if (!s_initialized || !s_topics_bound || actuator == NULL) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Circulation pump is always HIGH — ignore any attempt to drive it LOW */
+    if (channel == ACTUATOR_CHANNEL_CIRCULATION_PUMP) {
+        return ESP_OK;
     }
 
     gpio_set_level((gpio_num_t)actuator->gpio, is_on ? 1 : 0);

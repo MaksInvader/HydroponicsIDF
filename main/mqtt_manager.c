@@ -12,7 +12,7 @@
 
 #define MQTT_CONNECTED_BIT        BIT0
 #define MQTT_SETUP_SUCCESS_BIT    BIT1
-#define MQTT_MAX_SUBSCRIPTIONS    12
+#define MQTT_MAX_SUBSCRIPTIONS    24
 #define MQTT_DEFAULT_SUB_QOS      1
 #define MQTT_SUB_LOCK_TIMEOUT_MS  100
 
@@ -32,8 +32,15 @@ static char                     s_success_topic[96];
 static mqtt_subscription_entry_t s_subscriptions[MQTT_MAX_SUBSCRIPTIONS];
 static SemaphoreHandle_t        s_subscriptions_lock;
 static uint32_t                 s_subscriptions_lock_timeout_count;
-static mqtt_manager_connection_cb_t s_connection_cb;
-static void *s_connection_ctx;
+#define MQTT_MAX_CONNECTION_CBS  4
+
+typedef struct {
+    mqtt_manager_connection_cb_t cb;
+    void *user_ctx;
+} mqtt_conn_cb_entry_t;
+
+static mqtt_conn_cb_entry_t s_connection_cbs[MQTT_MAX_CONNECTION_CBS];
+static size_t               s_connection_cb_count;
 
 typedef struct {
     char topic[128];
@@ -176,8 +183,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         xEventGroupSetBits(s_event_group, MQTT_CONNECTED_BIT);
 
         mqtt_manager_resubscribe_all();
-        if (s_connection_cb != NULL) {
-            s_connection_cb(true, s_connection_ctx);
+        for (size_t _i = 0; _i < s_connection_cb_count; _i++) {
+            if (s_connection_cbs[_i].cb != NULL) {
+                s_connection_cbs[_i].cb(true, s_connection_cbs[_i].user_ctx);
+            }
         }
 
         break;
@@ -185,8 +194,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT disconnected");
         xEventGroupClearBits(s_event_group, MQTT_CONNECTED_BIT);
-        if (s_connection_cb != NULL) {
-            s_connection_cb(false, s_connection_ctx);
+        for (size_t _i = 0; _i < s_connection_cb_count; _i++) {
+            if (s_connection_cbs[_i].cb != NULL) {
+                s_connection_cbs[_i].cb(false, s_connection_cbs[_i].user_ctx);
+            }
         }
         break;
 
@@ -257,8 +268,8 @@ esp_err_t mqtt_manager_init(const char *broker_ip, int broker_port)
 
     s_subscriptions_lock_timeout_count = 0;
     s_success_topic[0]    = '\0';
-    s_connection_cb = NULL;
-    s_connection_ctx = NULL;
+    memset(s_connection_cbs, 0, sizeof(s_connection_cbs));
+    s_connection_cb_count = 0;
 
     char broker_uri[128];
     int written = snprintf(broker_uri, sizeof(broker_uri),
@@ -318,8 +329,8 @@ esp_err_t mqtt_manager_deinit(void)
     }
 
     s_success_topic[0]    = '\0';
-    s_connection_cb = NULL;
-    s_connection_ctx = NULL;
+    memset(s_connection_cbs, 0, sizeof(s_connection_cbs));
+    s_connection_cb_count = 0;
 
     if (s_event_group != NULL) {
         xEventGroupClearBits(s_event_group, MQTT_CONNECTED_BIT | MQTT_SETUP_SUCCESS_BIT);
@@ -499,7 +510,52 @@ uint32_t mqtt_manager_get_lock_timeout_count(void)
 
 esp_err_t mqtt_manager_set_connection_cb(mqtt_manager_connection_cb_t cb, void *user_ctx)
 {
-    s_connection_cb = cb;
-    s_connection_ctx = user_ctx;
+    /* Legacy single-slot API: replace the first entry or clear all if cb==NULL */
+    if (cb == NULL) {
+        memset(s_connection_cbs, 0, sizeof(s_connection_cbs));
+        s_connection_cb_count = 0;
+        return ESP_OK;
+    }
+    /* Replace slot 0 */
+    s_connection_cbs[0].cb       = cb;
+    s_connection_cbs[0].user_ctx = user_ctx;
+    if (s_connection_cb_count == 0) s_connection_cb_count = 1;
     return ESP_OK;
+}
+
+esp_err_t mqtt_manager_add_connection_cb(mqtt_manager_connection_cb_t cb, void *user_ctx)
+{
+    if (cb == NULL) return ESP_ERR_INVALID_ARG;
+    /* Check for duplicate */
+    for (size_t i = 0; i < s_connection_cb_count; i++) {
+        if (s_connection_cbs[i].cb == cb) {
+            s_connection_cbs[i].user_ctx = user_ctx;
+            return ESP_OK;
+        }
+    }
+    if (s_connection_cb_count >= MQTT_MAX_CONNECTION_CBS) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_connection_cbs[s_connection_cb_count].cb       = cb;
+    s_connection_cbs[s_connection_cb_count].user_ctx = user_ctx;
+    s_connection_cb_count++;
+    return ESP_OK;
+}
+
+esp_err_t mqtt_manager_remove_connection_cb(mqtt_manager_connection_cb_t cb)
+{
+    if (cb == NULL) return ESP_ERR_INVALID_ARG;
+    for (size_t i = 0; i < s_connection_cb_count; i++) {
+        if (s_connection_cbs[i].cb == cb) {
+            /* Shift remaining entries down */
+            for (size_t j = i; j + 1 < s_connection_cb_count; j++) {
+                s_connection_cbs[j] = s_connection_cbs[j + 1];
+            }
+            memset(&s_connection_cbs[s_connection_cb_count - 1], 0,
+                   sizeof(s_connection_cbs[0]));
+            s_connection_cb_count--;
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
 }

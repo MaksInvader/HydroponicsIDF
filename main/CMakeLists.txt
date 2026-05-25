@@ -27,7 +27,6 @@ idf_component_register(
         app_update
         esp-tls
         driver
-        esp_adc
         onewire_bus
         ds18b20
 )

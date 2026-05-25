@@ -3,14 +3,53 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "pin_config.h"
 
-#define FAULT_LED_DEFAULT_MS 5000U
+#define FAULT_LED_DEFAULT_MS  5000U
+#define BLINK_QUEUE_LEN       4
+#define BLINK_TASK_STACK      1536
+#define BLINK_TASK_PRIORITY   1     /* low priority — purely cosmetic */
+
+/* Special duration value that tells the blink task to turn the LED off
+ * immediately and discard any queued blink. */
+#define BLINK_CANCEL          0xFFFFFFFFU
 
 static const char *TAG = "indicator_led";
-static bool s_initialized = false;
+
+static bool           s_initialized = false;
+static QueueHandle_t  s_blink_queue = NULL;
+static TaskHandle_t   s_blink_task  = NULL;
+
+/* ── Background blink task ───────────────────────────────────────────────── */
+
+static void blink_task(void *arg)
+{
+    (void)arg;
+    uint32_t duration_ms;
+
+    while (true) {
+        /* Block indefinitely until a blink request arrives. */
+        if (xQueueReceive(s_blink_queue, &duration_ms, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        if (duration_ms == BLINK_CANCEL) {
+            gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
+            /* Drain any further queued requests. */
+            while (xQueueReceive(s_blink_queue, &duration_ms, 0) == pdTRUE) {}
+            continue;
+        }
+
+        gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
+        vTaskDelay(pdMS_TO_TICKS(duration_ms));
+        gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
+    }
+}
+
+/* ── Public API ──────────────────────────────────────────────────────────── */
 
 esp_err_t indicator_led_init(void)
 {
@@ -35,6 +74,21 @@ esp_err_t indicator_led_init(void)
     gpio_set_level((gpio_num_t)PIN_LED_CONNECTION, 0);
     gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
 
+    s_blink_queue = xQueueCreate(BLINK_QUEUE_LEN, sizeof(uint32_t));
+    if (s_blink_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create blink queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t ok = xTaskCreate(blink_task, "led_blink", BLINK_TASK_STACK,
+                                NULL, BLINK_TASK_PRIORITY, &s_blink_task);
+    if (ok != pdPASS) {
+        vQueueDelete(s_blink_queue);
+        s_blink_queue = NULL;
+        ESP_LOGE(TAG, "Failed to create blink task");
+        return ESP_ERR_NO_MEM;
+    }
+
     s_initialized = true;
     ESP_LOGI(TAG, "Indicator LEDs initialised (conn=GPIO%d, fault=GPIO%d)",
              PIN_LED_CONNECTION, PIN_LED_FAULT);
@@ -51,21 +105,27 @@ void indicator_led_set_connection(bool connected)
 
 void indicator_led_fault_blink(uint32_t duration_ms)
 {
-    if (!s_initialized) {
+    if (!s_initialized || s_blink_queue == NULL) {
         return;
     }
-    if (duration_ms == 0) {
+    if (duration_ms == 0 || duration_ms == BLINK_CANCEL) {
         duration_ms = FAULT_LED_DEFAULT_MS;
     }
-    gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
-    gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
+    /* Non-blocking send — drop silently if queue is full. */
+    xQueueSend(s_blink_queue, &duration_ms, 0);
 }
 
 void indicator_led_set_fault(bool on)
 {
-    if (!s_initialized) {
+    if (!s_initialized || s_blink_queue == NULL) {
         return;
     }
-    gpio_set_level((gpio_num_t)PIN_LED_FAULT, on ? 1 : 0);
+    if (on) {
+        /* Drive immediately from this task context. */
+        gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
+    } else {
+        /* Send cancel so the blink task also turns it off if it's mid-blink. */
+        uint32_t cancel = BLINK_CANCEL;
+        xQueueSend(s_blink_queue, &cancel, 0);
+    }
 }

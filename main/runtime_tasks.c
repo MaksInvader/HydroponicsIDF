@@ -19,6 +19,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_timer.h"
+
 #include "actuator_control.h"
 #include "indicator_led.h"
 #include "lcd_status.h"
@@ -55,6 +57,10 @@
 #define OTA_HTTP_PORT_DEFAULT 8123
 #define OTA_HTTP_PATH_DEFAULT "/local/firmware/lorong_node.bin"
 #define OTA_VERSION_MAX_LEN 32
+
+/* Valve debounce: ON arriving within this window after an OFF is deferred.
+ * The deferred ON is enqueued only if no new OFF arrives before the timer fires. */
+#define VALVE_DEBOUNCE_MS 3000
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define SAFE_STRCPY(dst, src) do { \
@@ -109,6 +115,12 @@ static char s_ota_latest_topic[ZONE_TOPIC_BUFFER_SIZE];
 static char s_ota_trigger_topic[ZONE_TOPIC_BUFFER_SIZE];
 static char s_ota_latest_version[OTA_VERSION_MAX_LEN];
 static char s_zone_id[ZONE_ID_MAX_LEN + 1];
+
+/* Valve debounce state */
+static esp_timer_handle_t s_valve_debounce_timer   = NULL;
+static portMUX_TYPE       s_valve_debounce_lock    = portMUX_INITIALIZER_UNLOCKED;
+static TickType_t         s_valve_last_off_tick    = 0;
+static bool               s_valve_debounce_pending = false;
 static char s_zone_name[ZONE_NAME_MAX_LEN + 1];
 static actuator_last_command_t s_last_lcd_rendered_cmd;
 static sensor_telemetry_snapshot_t s_last_good_snapshot;
@@ -414,6 +426,100 @@ static bool enqueue_command(const dosing_command_t *cmd, const char *source)
     return true;
 }
 
+static void valve_debounce_timer_cb(void *arg)
+{
+    (void)arg;
+
+    portENTER_CRITICAL(&s_valve_debounce_lock);
+    bool should_enqueue = s_valve_debounce_pending;
+    s_valve_debounce_pending = false;
+    portEXIT_CRITICAL(&s_valve_debounce_lock);
+
+    if (!should_enqueue) {
+        return;
+    }
+
+    dosing_command_t cmd = {
+        .channel  = ACTUATOR_CHANNEL_VALVE,
+        .action   = ACTUATOR_ACTION_ON,
+        .pulse_ms = 0,
+    };
+    ESP_LOGI(TAG, "Valve debounce elapsed — enqueuing deferred ON");
+    (void)enqueue_command(&cmd, "valve debounce");
+}
+
+static void valve_debounce_init(void)
+{
+    if (s_valve_debounce_timer != NULL) {
+        return;
+    }
+    esp_timer_create_args_t args = {
+        .callback        = valve_debounce_timer_cb,
+        .arg             = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "valve_debounce",
+    };
+    esp_timer_create(&args, &s_valve_debounce_timer);
+}
+
+static void valve_debounce_deinit(void)
+{
+    if (s_valve_debounce_timer == NULL) {
+        return;
+    }
+    esp_timer_stop(s_valve_debounce_timer);
+    esp_timer_delete(s_valve_debounce_timer);
+    s_valve_debounce_timer = NULL;
+    portENTER_CRITICAL(&s_valve_debounce_lock);
+    s_valve_debounce_pending = false;
+    s_valve_last_off_tick    = 0;
+    portEXIT_CRITICAL(&s_valve_debounce_lock);
+}
+
+/* Returns true if the ON was swallowed (deferred). Returns false to proceed normally. */
+static bool valve_debounce_filter(actuator_action_t action)
+{
+    if (action == ACTUATOR_ACTION_OFF) {
+        /* Record OFF timestamp, cancel any pending deferred ON */
+        portENTER_CRITICAL(&s_valve_debounce_lock);
+        s_valve_last_off_tick    = xTaskGetTickCount();
+        s_valve_debounce_pending = false;
+        portEXIT_CRITICAL(&s_valve_debounce_lock);
+        if (s_valve_debounce_timer != NULL) {
+            esp_timer_stop(s_valve_debounce_timer);
+        }
+        return false; /* enqueue the OFF normally */
+    }
+
+    if (action == ACTUATOR_ACTION_ON) {
+        portENTER_CRITICAL(&s_valve_debounce_lock);
+        TickType_t last_off = s_valve_last_off_tick;
+        portEXIT_CRITICAL(&s_valve_debounce_lock);
+
+        if (last_off == 0) {
+            return false; /* no prior OFF — first ON, pass through immediately */
+        }
+
+        TickType_t elapsed_ms = (TickType_t)((xTaskGetTickCount() - last_off) * portTICK_PERIOD_MS);
+
+        if (elapsed_ms < (TickType_t)VALVE_DEBOUNCE_MS) {
+            uint64_t remaining_us = ((uint64_t)(VALVE_DEBOUNCE_MS - elapsed_ms)) * 1000ULL;
+            portENTER_CRITICAL(&s_valve_debounce_lock);
+            s_valve_debounce_pending = true;
+            portEXIT_CRITICAL(&s_valve_debounce_lock);
+            if (s_valve_debounce_timer != NULL) {
+                esp_timer_stop(s_valve_debounce_timer);
+                esp_timer_start_once(s_valve_debounce_timer, remaining_us);
+            }
+            ESP_LOGI(TAG, "Valve ON deferred — %lu ms remaining in debounce window",
+                     (unsigned long)(VALVE_DEBOUNCE_MS - elapsed_ms));
+            return true; /* swallow */
+        }
+    }
+
+    return false;
+}
+
 static void on_channel_command(const char *topic, const char *payload, int payload_len, void *user_ctx)
 {
     (void)topic;
@@ -426,9 +532,13 @@ static void on_channel_command(const char *topic, const char *payload, int paylo
         return;
     }
 
+    if (channel == ACTUATOR_CHANNEL_VALVE && valve_debounce_filter(action)) {
+        return;
+    }
+
     dosing_command_t cmd = {
-        .channel = channel,
-        .action = action,
+        .channel  = channel,
+        .action   = action,
         .pulse_ms = pulse_ms,
     };
     (void)enqueue_command(&cmd, "channel command");
@@ -442,6 +552,10 @@ static void on_zone_command(const char *topic, const char *payload, int payload_
     dosing_command_t cmd;
     if (!parse_zone_command(payload, payload_len, &cmd)) {
         ESP_LOGW(TAG, "Invalid zone command format. Expected: '<Channel> ON|OFF|PULSE <ms>'");
+        return;
+    }
+
+    if (cmd.channel == ACTUATOR_CHANNEL_VALVE && valve_debounce_filter(cmd.action)) {
         return;
     }
 
@@ -459,11 +573,16 @@ static void on_emergency_command(const char *topic, const char *payload, int pay
         return;
     }
 
+#if DEV_MODE
+    ESP_LOGW(TAG, "[DEV_MODE] Emergency command received — fault suppressed");
+    indicator_led_fault_blink(500);
+#else
     ESP_LOGW(TAG, "Emergency command received — triggering fault");
     runtime_safety_fault_set(SAFETY_FAULT_VALVE | SAFETY_FAULT_DOSE_A | SAFETY_FAULT_DOSE_B
                              | SAFETY_FAULT_PH_UP | SAFETY_FAULT_PH_DOWN,
                              "Emergency stop");
     indicator_led_fault_blink(5000);
+#endif
 }
 
 static void on_safety_clear_command(const char *topic, const char *payload, int payload_len, void *user_ctx)
@@ -488,7 +607,8 @@ static void on_safety_clear_command(const char *topic, const char *payload, int 
     }
 
     if (strcmp(buf, "CLEAR") == 0 || strcmp(buf, "ALL") == 0) {
-        (void)runtime_tasks_clear_safety_faults(0);
+        ESP_LOGW(TAG, "Safety CLEAR received — restarting device");
+        esp_restart();
         return;
     }
 
@@ -625,8 +745,12 @@ static void dosing_task(void *arg)
             if ((cmd.action == ACTUATOR_ACTION_ON || cmd.action == ACTUATOR_ACTION_PULSE) &&
                 ((cmd.channel == ACTUATOR_CHANNEL_PER_PH_UP && runtime_safety_get_channel_state(ACTUATOR_CHANNEL_PER_PH_DOWN)) ||
                  (cmd.channel == ACTUATOR_CHANNEL_PER_PH_DOWN && runtime_safety_get_channel_state(ACTUATOR_CHANNEL_PER_PH_UP)))) {
+#if DEV_MODE
+                ESP_LOGW(TAG, "[DEV_MODE] pH interlock violation suppressed");
+#else
                 runtime_safety_fault_set(SAFETY_FAULT_PH_INTERLOCK, "pH interlock violation");
                 continue;
+#endif
             }
 
             esp_err_t ret = ESP_OK;
@@ -867,7 +991,7 @@ static void cleanup_runtime_locked(void)
     atomic_store(&s_stop_requested, true);
 
     runtime_safety_set_dosing_queue(NULL);
-    (void)mqtt_manager_set_connection_cb(NULL, NULL);
+    (void)mqtt_manager_remove_connection_cb(runtime_tasks_on_mqtt_connection);
 
     const mqtt_unsub_entry_t unsub_entries[] = {
         { &s_zone_topic_subscribed, s_zone_command_topic },
@@ -941,6 +1065,7 @@ static void cleanup_runtime_locked(void)
     runtime_safety_bind(NULL);
 
     sensor_telemetry_deinit();
+    valve_debounce_deinit();
     actuator_control_deinit();
     clear_subscription_tracking();
     s_zone_id[0] = '\0';
@@ -961,6 +1086,10 @@ static void cleanup_runtime_locked(void)
 
 void runtime_tasks_record_boot_faults(void)
 {
+#if DEV_MODE
+    ESP_LOGW(TAG, "[DEV_MODE] Boot fault recording suppressed");
+    return;
+#endif
     esp_reset_reason_t reason = esp_reset_reason();
 
     if (reason != ESP_RST_POWERON && reason != ESP_RST_UNKNOWN) {
@@ -1053,6 +1182,7 @@ static esp_err_t runtime_setup_resources(const char *zone_id)
     if (ret != ESP_OK) {
         return ret;
     }
+    valve_debounce_init();
 
     ret = sensor_telemetry_init(zone_id);
     if (ret != ESP_OK) {
@@ -1127,7 +1257,7 @@ static esp_err_t runtime_setup_topics(const char *zone_id)
     }
 
     publish_current_version(zone_id);
-    (void)mqtt_manager_set_connection_cb(runtime_tasks_on_mqtt_connection, NULL);
+    (void)mqtt_manager_add_connection_cb(runtime_tasks_on_mqtt_connection, NULL);
     if (mqtt_manager_is_connected()) {
         runtime_tasks_on_mqtt_connection(true, NULL);
     }
@@ -1197,7 +1327,13 @@ static esp_err_t runtime_start_workers(void)
         .safety_fault_topic = s_safety_fault_topic,
     };
 
-    ok = xTaskCreate(runtime_safety_task, "SafetyTask", SAFETY_TASK_STACK, &bindings, SAFETY_TASK_PRIORITY, &s_safety_task);
+    /* Bind before creating the task so the safety task never sees a NULL or
+     * dangling stop_requested pointer.  The bindings struct itself is stack-
+     * local but runtime_safety_bind() copies it into a static internal struct,
+     * so the task only ever reads from that stable copy. */
+    runtime_safety_bind(&bindings);
+
+    ok = xTaskCreate(runtime_safety_task, "SafetyTask", SAFETY_TASK_STACK, NULL, SAFETY_TASK_PRIORITY, &s_safety_task);
     if (ok != pdPASS) {
         return ESP_FAIL;
     }

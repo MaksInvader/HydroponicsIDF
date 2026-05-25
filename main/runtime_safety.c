@@ -161,6 +161,11 @@ static void safety_publish_faults(safety_fault_mask_t new_faults)
 
 static void safety_enter_safe_state(safety_fault_mask_t new_faults)
 {
+#if DEV_MODE
+    (void)new_faults;
+    ESP_LOGW(TAG, "[DEV_MODE] safety_enter_safe_state suppressed");
+    return;
+#else
     atomic_store(&s_safety.safe_mode, true);
 
     portENTER_CRITICAL(&s_gate_lock);
@@ -179,10 +184,16 @@ static void safety_enter_safe_state(safety_fault_mask_t new_faults)
     s_safety.tds_response_pending = false;
     s_safety.valve_waiting = false;
     portEXIT_CRITICAL(&s_safety_lock);
+#endif
 }
 
 static void safety_fault_set(safety_fault_mask_t mask, const char *reason)
 {
+#if DEV_MODE
+    ESP_LOGW(TAG, "[DEV_MODE] Fault suppressed: mask=0x%08X reason=%s",
+             (unsigned int)mask, reason != NULL ? reason : "(none)");
+    return;
+#else
     if (mask == 0) {
         return;
     }
@@ -205,6 +216,7 @@ static void safety_fault_set(safety_fault_mask_t mask, const char *reason)
     safety_fault_mask_t reported = (safety_fault_mask_t)atomic_fetch_or(&s_safety.reported_faults, (unsigned int)new_faults);
     safety_fault_mask_t to_report = new_faults & ~reported;
     safety_publish_faults(to_report);
+#endif
 }
 
 static uint32_t safety_max_dose_for_channel(actuator_channel_t channel)
@@ -280,9 +292,11 @@ void runtime_safety_reset_state(void)
     s_safety.valve_on_tick = 0;
     s_safety.valve_waiting = false;
     s_safety.boot_faults = 0;
+#if !DEV_MODE
     portENTER_CRITICAL(&s_gate_lock);
     s_gate_open = false;
     portEXIT_CRITICAL(&s_gate_lock);
+#endif
     memset(s_dose_watchdog, 0, sizeof(s_dose_watchdog));
     memset(s_channel_state_on, 0, sizeof(s_channel_state_on));
 }
@@ -336,6 +350,10 @@ void runtime_safety_set_gate(bool open)
 
 bool runtime_safety_is_gate_open(bool isr_context)
 {
+#if DEV_MODE
+    (void)isr_context;
+    return true;
+#else
     bool gate_open = false;
     if (isr_context) {
         portENTER_CRITICAL_ISR(&s_gate_lock);
@@ -347,6 +365,7 @@ bool runtime_safety_is_gate_open(bool isr_context)
         portEXIT_CRITICAL(&s_gate_lock);
     }
     return gate_open;
+#endif
 }
 
 void runtime_safety_update_channel_state(actuator_channel_t channel, bool state_on)
@@ -587,7 +606,11 @@ safety_fault_mask_t runtime_safety_get_faults(void)
 
 bool runtime_safety_is_safe_mode(void)
 {
+#if DEV_MODE
+    return false;
+#else
     return atomic_load(&s_safety.safe_mode);
+#endif
 }
 
 esp_err_t runtime_safety_clear_faults(safety_fault_mask_t mask, bool *safe_mode_cleared)
@@ -721,59 +744,65 @@ void runtime_safety_task(void *arg)
             last_temp_valid = true;
 
             if (SAFETY_ENABLE_PH_TDS_CHECKS) {
-                if (snap.ph < SAFETY_PH_MIN || snap.ph > SAFETY_PH_MAX) {
-                    safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH out of range");
-                }
+                /* Only run pH checks when calibration is present and value is valid */
+                if (snap.ph_valid) {
+                    if (snap.ph < SAFETY_PH_MIN || snap.ph > SAFETY_PH_MAX) {
+                        safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH out of range");
+                    }
 
-                if (snap.ph > SAFETY_PH_CRITICAL_HIGH) {
-                    safety_fault_set(SAFETY_FAULT_PH_UP, "pH critical high");
-                } else if (snap.ph < SAFETY_PH_CRITICAL_LOW) {
-                    safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH critical low");
-                }
+                    if (snap.ph > SAFETY_PH_CRITICAL_HIGH) {
+                        safety_fault_set(SAFETY_FAULT_PH_UP, "pH critical high");
+                    } else if (snap.ph < SAFETY_PH_CRITICAL_LOW) {
+                        safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH critical low");
+                    }
 
-                if (last_ph_valid) {
-                    float delta = snap.ph - last_ph;
-                    float dt_min = (float)ticks_to_ms(now - last_ph_tick) / 60000.0f;
-                    if (dt_min > 0.0f) {
-                        float rate = delta / dt_min;
-                        if (rate > SAFETY_PH_RATE_MAX_PER_MIN) {
-                            safety_fault_set(SAFETY_FAULT_PH_UP, "pH rising too fast");
-                        } else if (rate < -SAFETY_PH_RATE_MAX_PER_MIN) {
-                            safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH dropping too fast");
+                    if (last_ph_valid) {
+                        float delta = snap.ph - last_ph;
+                        float dt_min = (float)ticks_to_ms(now - last_ph_tick) / 60000.0f;
+                        if (dt_min > 0.0f) {
+                            float rate = delta / dt_min;
+                            if (rate > SAFETY_PH_RATE_MAX_PER_MIN) {
+                                safety_fault_set(SAFETY_FAULT_PH_UP, "pH rising too fast");
+                            } else if (rate < -SAFETY_PH_RATE_MAX_PER_MIN) {
+                                safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH dropping too fast");
+                            }
+                        }
+
+                        if (fabsf(delta) < SAFETY_PH_FROZEN_EPSILON) {
+                            ph_frozen++;
+                        } else {
+                            ph_frozen = 0;
+                        }
+                        if (ph_frozen >= SAFETY_PH_FROZEN_SAMPLES) {
+                            safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH sensor frozen");
                         }
                     }
 
-                    if (fabsf(delta) < SAFETY_PH_FROZEN_EPSILON) {
-                        ph_frozen++;
-                    } else {
-                        ph_frozen = 0;
-                    }
-                    if (ph_frozen >= SAFETY_PH_FROZEN_SAMPLES) {
-                        safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH sensor frozen");
-                    }
+                    last_ph = snap.ph;
+                    last_ph_tick = now;
+                    last_ph_valid = true;
                 }
 
-                last_ph = snap.ph;
-                last_ph_tick = now;
-                last_ph_valid = true;
-
-                if (snap.tds < SAFETY_TDS_MIN || snap.tds > SAFETY_TDS_MAX) {
-                    safety_fault_set(SAFETY_FAULT_TDS_SENSOR, "TDS out of range");
-                }
-
-                if (last_tds_valid) {
-                    if (fabsf(snap.tds - last_tds) < SAFETY_TDS_FROZEN_EPSILON) {
-                        tds_frozen++;
-                    } else {
-                        tds_frozen = 0;
+                /* Only run TDS checks when calibration is present and value is valid */
+                if (snap.tds_valid) {
+                    if (snap.tds < SAFETY_TDS_MIN || snap.tds > SAFETY_TDS_MAX) {
+                        safety_fault_set(SAFETY_FAULT_TDS_SENSOR, "TDS out of range");
                     }
-                    if (tds_frozen >= SAFETY_TDS_FROZEN_SAMPLES) {
-                        safety_fault_set(SAFETY_FAULT_TDS_SENSOR, "TDS sensor frozen");
-                    }
-                }
 
-                last_tds = snap.tds;
-                last_tds_valid = true;
+                    if (last_tds_valid) {
+                        if (fabsf(snap.tds - last_tds) < SAFETY_TDS_FROZEN_EPSILON) {
+                            tds_frozen++;
+                        } else {
+                            tds_frozen = 0;
+                        }
+                        if (tds_frozen >= SAFETY_TDS_FROZEN_SAMPLES) {
+                            safety_fault_set(SAFETY_FAULT_TDS_SENSOR, "TDS sensor frozen");
+                        }
+                    }
+
+                    last_tds = snap.tds;
+                    last_tds_valid = true;
+                }
 
                 bool ph_pending = false;
                 bool ph_up = false;

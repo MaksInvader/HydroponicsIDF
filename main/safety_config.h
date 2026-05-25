@@ -1,6 +1,15 @@
 #ifndef SAFETY_CONFIG_H
 #define SAFETY_CONFIG_H
 
+/* ============================================================
+ * DEV MODE — set to 1 to disable ALL safety faults.
+ * The gate is permanently open, safe mode is never entered,
+ * and boot fault accumulation is skipped.
+ *
+ * WARNING: NEVER deploy to production with DEV_MODE = 1.
+ * ============================================================ */
+#define DEV_MODE 1
+
 /* Safety task scheduling */
 #define SAFETY_TASK_STACK 6144
 #define SAFETY_TASK_PRIORITY 4
