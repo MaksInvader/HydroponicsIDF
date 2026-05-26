@@ -8,7 +8,7 @@
  *
  * WARNING: NEVER deploy to production with DEV_MODE = 1.
  * ============================================================ */
-#define DEV_MODE 1
+#define DEV_MODE 0
 
 /* Safety task scheduling */
 #define SAFETY_TASK_STACK 6144
