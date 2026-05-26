@@ -38,14 +38,17 @@ static void blink_task(void *arg)
 
         if (duration_ms == BLINK_CANCEL) {
             gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
+            gpio_set_level((gpio_num_t)PIN_RESERVE_BINARY, 0);
             /* Drain any further queued requests. */
             while (xQueueReceive(s_blink_queue, &duration_ms, 0) == pdTRUE) {}
             continue;
         }
 
         gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
+        gpio_set_level((gpio_num_t)PIN_RESERVE_BINARY, 1);
         vTaskDelay(pdMS_TO_TICKS(duration_ms));
         gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
+        gpio_set_level((gpio_num_t)PIN_RESERVE_BINARY, 0);
     }
 }
 
@@ -58,7 +61,8 @@ esp_err_t indicator_led_init(void)
     }
 
     gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << PIN_LED_CONNECTION) | (1ULL << PIN_LED_FAULT),
+        .pin_bit_mask = (1ULL << PIN_LED_CONNECTION) | (1ULL << PIN_LED_FAULT)
+                      | (1ULL << PIN_RESERVE_BINARY),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -73,6 +77,7 @@ esp_err_t indicator_led_init(void)
 
     gpio_set_level((gpio_num_t)PIN_LED_CONNECTION, 0);
     gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
+    gpio_set_level((gpio_num_t)PIN_RESERVE_BINARY, 0);
 
     s_blink_queue = xQueueCreate(BLINK_QUEUE_LEN, sizeof(uint32_t));
     if (s_blink_queue == NULL) {
@@ -123,6 +128,7 @@ void indicator_led_set_fault(bool on)
     if (on) {
         /* Drive immediately from this task context. */
         gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
+        gpio_set_level((gpio_num_t)PIN_RESERVE_BINARY, 1);
     } else {
         /* Send cancel so the blink task also turns it off if it's mid-blink. */
         uint32_t cancel = BLINK_CANCEL;

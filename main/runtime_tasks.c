@@ -782,6 +782,19 @@ static void dosing_task(void *arg)
                 continue;
             }
 
+            /* Publish status feedback immediately after executing the command.
+             * For PULSE the actuator ends LOW, so publish OFF. */
+            {
+                const char *status_topic = actuator_control_get_status_topic(cmd.channel);
+                if (status_topic != NULL && status_topic[0] != '\0') {
+                    bool final_state = (cmd.action == ACTUATOR_ACTION_ON);
+                    if (cmd.action == ACTUATOR_ACTION_PULSE) {
+                        final_state = false;
+                    }
+                    mqtt_manager_publish(status_topic, final_state ? "ON" : "OFF", 1, 0);
+                }
+            }
+
             runtime_safety_dose_watchdog_update(cmd.channel, cmd.action, cmd.pulse_ms);
 
             if (cmd.channel == ACTUATOR_CHANNEL_VALVE) {

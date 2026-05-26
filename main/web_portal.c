@@ -5,6 +5,9 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "actuator_control.h"
 #include "lcd_status.h"
@@ -40,55 +43,15 @@ static const char *INDEX_HTML_TAIL =
     "<label>MQTT Broker IP</label><input name='broker_ip' required placeholder='192.168.1.20'>"
     "<label>MQTT Broker Port</label><input name='broker_port' type='number' min='1' max='65535' value='1883'>"
     "<button type='submit'>Apply / Reassign Zone and Run Setup</button></form>"
-    "<small><a href='/debug'>Open Runtime Debug Page</a></small>"
     "<small>Leave New Zone fields empty to keep the current zone.</small>"
     "<small>OTA firmware is served by the MQTT broker host.</small>"
     "<small>Device AP: ESP32S3-Updater (open network by default)</small>"
     "</div></body></html>";
 
-static const char *DEBUG_HTML_HEAD =
-    "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>ESP32S3 Debug</title>"
-    "<style>body{font-family:Arial,sans-serif;background:#eef2f7;padding:20px;}"
-    ".card{max-width:640px;margin:auto;background:#fff;padding:20px;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.08);}"
-    "h3{margin-top:14px;}pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow:auto;}a{color:#0f766e;}"
-    "</style></head><body><div class='card'><h2>Runtime Debug</h2>"
-    "<p><b>Current Zone:</b> <span id='zone'>loading...</span></p>"
-    "<h3>All Topics</h3><pre id='topics'>loading...</pre>"
-    "<h3>Last Commands (All Command Topics)</h3><pre id='lastcmds'>loading...</pre>"
-    "<h3>Last Sensor Publish</h3><pre id='sensor'>loading...</pre>"
-    "<h3>MQTT Health</h3><pre id='mqtthealth'>loading...</pre>";
+/* Debug page removed — use serial monitor for runtime diagnostics. */
 
-static const char *DEBUG_HTML_TAIL =
-    "<p><a href='/'>Back to Setup</a></p>"
-    "<script>"
-    "async function refreshDebug(){"
-    "try{"
-    "const r=await fetch('/debug/data',{cache:'no-store'});"
-    "if(!r.ok){throw new Error('HTTP '+r.status);}"
-    "const d=await r.json();"
-    "document.getElementById('zone').textContent=d.zone;"
-    "document.getElementById('topics').textContent=d.topics.join('\\n');"
-    "document.getElementById('lastcmds').textContent=d.lastCommands.map(c=>"
-    "'Topic: '+c.topic+'\\n'+"
-    "'Channel: '+c.channel+'\\n'+"
-    "'Command: '+c.command+'\\n'+"
-    "'State: '+c.state"
-    ").join('\\n\\n');"
-    "document.getElementById('sensor').textContent="
-    "'WaterLevel: '+d.sensor.waterLevel+'\\n'+"
-    "'WaterTemp: '+d.sensor.waterTemp+'\\n'+"
-    "'pH: '+d.sensor.ph+'\\n'+"
-    "'TDS: '+d.sensor.tds+'\\n'+"
-    "'PublishCount: '+d.sensor.publishCount;"
-    "document.getElementById('mqtthealth').textContent="
-    "'SubscriptionsLockTimeoutCount: '+d.mqttHealth.subscriptionsLockTimeoutCount;"
-    "}catch(e){"
-    "document.getElementById('topics').textContent='Failed to fetch debug data';"
-    "}"
-    "}"
-    "refreshDebug();setInterval(refreshDebug,1000);"
-    "</script></div></body></html>";
+/* Forward declaration — defined after configure_post_handler. */
+static void restart_after_delay_task(void *arg);
 
 static char from_hex(char c)
 {
@@ -123,50 +86,7 @@ static void url_decode(char *dst, const char *src, size_t dst_len)
     dst[di] = '\0';
 }
 
-static bool json_escape_into(const char *src, char *dst, size_t dst_len)
-{
-    if (dst == NULL || dst_len == 0) {
-        return false;
-    }
-
-    if (src == NULL) {
-        dst[0] = '\0';
-        return true;
-    }
-
-    size_t di = 0;
-    for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; p++) {
-        unsigned char c = *p;
-        if (c == '"' || c == '\\') {
-            if (di + 2 >= dst_len) {
-                return false;
-            }
-            dst[di++] = '\\';
-            dst[di++] = (char)c;
-            continue;
-        }
-
-        if (c <= 0x1F) {
-            if (di + 6 >= dst_len) {
-                return false;
-            }
-            int written = snprintf(dst + di, dst_len - di, "\\u%04x", (unsigned)c);
-            if (written != 6) {
-                return false;
-            }
-            di += 6;
-            continue;
-        }
-
-        if (di + 1 >= dst_len) {
-            return false;
-        }
-        dst[di++] = (char)c;
-    }
-
-    dst[di] = '\0';
-    return true;
-}
+/* json_escape_into removed — only needed by the debug page which has been removed. */
 
 static void get_form_value(const char *body, const char *key, char *out, size_t out_len)
 {
@@ -498,27 +418,35 @@ static esp_err_t configure_post_handler(httpd_req_t *req)
         ESP_LOGW(TAG, "Runtime started, but failed to persist setup profile: %s", esp_err_to_name(save_setup_ret));
     }
 
+    /* Send the HTTP response before restarting so the browser receives it. */
+    const char *resp_msg = zone_reassigned
+        ? "Zone reassigned successfully. Wi-Fi connected. SetUp published and zone_id/Success received. Device will restart in 3 seconds."
+        : "Wi-Fi connected. SetUp published and zone_id/Success received. Device will restart in 3 seconds.";
+
+    esp_err_t resp_ret = httpd_resp_send(req, resp_msg, HTTPD_RESP_USE_STRLEN);
     free(body);
-    if (zone_reassigned) {
-        return httpd_resp_send(
-            req,
-            "Zone reassigned successfully. Wi-Fi connected. SetUp published and zone_id/Success received. OTA is triggered via HTTP using MQTT commands.",
-            HTTPD_RESP_USE_STRLEN);
-    }
-    return httpd_resp_send(
-        req,
-        "Wi-Fi connected. SetUp published and zone_id/Success received. OTA is triggered via HTTP using MQTT commands.",
-        HTTPD_RESP_USE_STRLEN);
+
+    /* Spawn the delayed-restart task — it will call esp_restart() after 3 s. */
+    xTaskCreate(restart_after_delay_task, "portal_restart", 2048, NULL, 5, NULL);
+
+    return resp_ret;
 }
 
-static esp_err_t debug_get_handler(httpd_req_t *req)
+/* --------------------------------------------------------------------------
+ * Delayed restart — gives the HTTP response time to reach the client.
+ * -------------------------------------------------------------------------- */
+
+static void restart_after_delay_task(void *arg)
 {
-    httpd_resp_set_type(req, "text/html");
-    ESP_ERROR_CHECK(httpd_resp_sendstr_chunk(req, DEBUG_HTML_HEAD));
-    ESP_ERROR_CHECK(httpd_resp_sendstr_chunk(req, DEBUG_HTML_TAIL));
-    return httpd_resp_sendstr_chunk(req, NULL);
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    ESP_LOGI(TAG, "Restarting now to apply new configuration...");
+    esp_restart();
 }
 
+/* debug_data_get_handler removed — debug page no longer exists. */
+
+#if 0
 static esp_err_t debug_data_get_handler(httpd_req_t *req)
 {
     zone_config_t zone_cfg;
@@ -658,6 +586,7 @@ static esp_err_t debug_data_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
+#endif /* debug_data_get_handler */
 
 esp_err_t web_portal_try_autostart_from_nvs(bool *started)
 {
@@ -772,24 +701,8 @@ esp_err_t web_portal_start(void)
         .user_ctx = NULL,
     };
 
-    httpd_uri_t debug_uri = {
-        .uri = "/debug",
-        .method = HTTP_GET,
-        .handler = debug_get_handler,
-        .user_ctx = NULL,
-    };
-
-    httpd_uri_t debug_data_uri = {
-        .uri = "/debug/data",
-        .method = HTTP_GET,
-        .handler = debug_data_get_handler,
-        .user_ctx = NULL,
-    };
-
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &configure_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &debug_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &debug_data_uri));
     ESP_LOGI(TAG, "Web portal running on http://192.168.4.1/");
     return ESP_OK;
 }

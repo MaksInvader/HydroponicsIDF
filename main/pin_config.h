@@ -11,21 +11,21 @@
 #define PIN_ACTUATOR_PER_PH_DOWN  38
 
 /* Circulation pump — always HIGH, never driven LOW by firmware */
-#define PIN_CIRCULATION_PUMP      45
+#define PIN_CIRCULATION_PUMP      47
 
 /* Relay output pins (generic, server-controlled) */
 #define PIN_RELAY_1               13
 #define PIN_RELAY_2               14
 #define PIN_RELAY_3               21
-#define PIN_RELAY_4               47
+#define PIN_RELAY_4               45
 
 /* Status / indicator LEDs */
 //#pilot1
-#define PIN_LED_CONNECTION        2   /* HIGH = broker connected */
-#define PIN_LED_FAULT             42   /* HIGH = fault or emergency active */
+#define PIN_LED_CONNECTION        1   /* HIGH = broker connected */
+#define PIN_LED_FAULT              2  /* HIGH = fault or emergency active */
 
 /* Reserved binary output */
-#define PIN_RESERVE_BINARY        41
+#define PIN_RESERVE_BINARY        42
 
 /* Sensor pins */
 #define PIN_SENSOR_WATER_LEVEL             5
@@ -44,5 +44,10 @@
 #define PIN_LCD_I2C_SDA      16
 #define PIN_LCD_I2C_SCL      15
 #define PIN_LCD_I2C_FREQ_HZ  100000
+
+/* Setup / reconfiguration button.
+ * Active LOW — button connects GPIO to GND; internal pull-up enabled.
+ * Hold for 3 s to enter setup mode. */
+#define PIN_SETUP_BUTTON     7
 
 #endif
