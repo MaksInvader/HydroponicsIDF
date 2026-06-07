@@ -209,6 +209,14 @@ static esp_err_t bind_actuator_topics(const char *zone_id)
     return ESP_OK;
 }
 
+esp_err_t actuator_control_early_gpio_init(void)
+{
+    /* Drive all actuator GPIOs to their safe (OFF) state as early as
+     * possible during boot, before NVS or MQTT are available.
+     * init_gpios_once() is idempotent — safe to call again later. */
+    return init_gpios_once();
+}
+
 esp_err_t actuator_control_init(const char *zone_id)
 {
     if (zone_id == NULL || strlen(zone_id) == 0) {
@@ -419,3 +427,4 @@ esp_err_t actuator_control_get_all_last_commands(actuator_last_command_t *out_ar
     *out_count = n;
     return ESP_OK;
 }
+

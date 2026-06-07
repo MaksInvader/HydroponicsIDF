@@ -108,19 +108,29 @@ static esp_err_t load_calibration(const char *slope_key,
 
     uint8_t valid_u8 = 0;
     if (ret == ESP_OK) ret = nvs_get_u8(h, valid_key, &valid_u8);
-    if (ret == ESP_OK) ret = nvs_get_u32(h, upd_at_key, &c->updated_at);
 
-    nvs_close(h);
+        /* updated_at is optional — absent on devices calibrated before this field
+         * was added to the NVS schema.  A missing key must not discard the rest. */
+        if (ret == ESP_OK) {
+            esp_err_t upd_ret = nvs_get_u32(h, upd_at_key, &c->updated_at);
+            if (upd_ret == ESP_ERR_NVS_NOT_FOUND) {
+                c->updated_at = 0; /* treat as epoch — calibration is still valid */
+            } else if (upd_ret != ESP_OK) {
+                ret = upd_ret;     /* real I/O error — propagate */
+            }
+        }
 
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        memset(c, 0, sizeof(*c));
-        return ESP_OK; /* keys absent — not yet calibrated */
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "load_calibration failed (%s): %s",
-                 slope_key, esp_err_to_name(ret));
-        return ret;
-    }
+        nvs_close(h);
+
+        if (ret == ESP_ERR_NVS_NOT_FOUND) {
+            memset(c, 0, sizeof(*c));
+            return ESP_OK; /* mandatory keys absent — not yet calibrated */
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "load_calibration failed (%s): %s",
+                     slope_key, esp_err_to_name(ret));
+            return ret;
+        }
 
     c->valid = (bool)valid_u8;
     *found   = true;

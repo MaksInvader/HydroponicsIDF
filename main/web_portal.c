@@ -8,9 +8,9 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "syslog.h"
 
 #include "actuator_control.h"
-#include "lcd_status.h"
 #include "mqtt_manager.h"
 #include "runtime_tasks.h"
 #include "sensor_telemetry.h"
@@ -41,6 +41,7 @@ static const char *INDEX_HTML_TAIL =
     "<label>New Zone ID (optional, reassign device)</label><input name='zone_id' maxlength='32' placeholder='zone_N'>"
     "<label>New Zone Name (optional, reassign device)</label><input name='zone_name' maxlength='64' placeholder='Lorong Zone N'>"
     "<label>MQTT Broker IP</label><input name='broker_ip' required placeholder='192.168.1.20'>"
+    "<small style='color:#b45309'>Use a numeric IP address (e.g. 192.168.1.20). Hostnames like <b>msi.local</b> (.local mDNS names) will NOT resolve on the device.</small>"
     "<label>MQTT Broker Port</label><input name='broker_port' type='number' min='1' max='65535' value='1883'>"
     "<button type='submit'>Apply / Reassign Zone and Run Setup</button></form>"
     "<small>Leave New Zone fields empty to keep the current zone.</small>"
@@ -267,8 +268,6 @@ static portal_setup_result_t start_runtime_with_request(const portal_request_t *
         return PORTAL_SETUP_WIFI_FAILED;
     }
 
-    lcd_status_show_wifi_and_broker(req->ssid, req->broker_ip);
-
     esp_err_t mqtt_init_ret = mqtt_manager_init(req->broker_ip, req->broker_port);
     if (mqtt_init_ret != ESP_OK) {
         return PORTAL_SETUP_MQTT_INIT_FAILED;
@@ -284,7 +283,6 @@ static portal_setup_result_t start_runtime_with_request(const portal_request_t *
         return PORTAL_SETUP_RUNTIME_FAILED;
     }
 
-    lcd_status_show_zone_overview(zone->zone_id, zone->zone_name, "None");
     return PORTAL_SETUP_OK;
 }
 
@@ -628,12 +626,20 @@ esp_err_t web_portal_try_autostart_from_nvs(bool *started)
 
     ESP_LOGI(TAG, "Autostart: trying saved Wi-Fi '%s' and zone '%s'", setup_cfg.ssid, zone_cfg.zone_id);
 
-    ret = wifi_manager_connect_sta(setup_cfg.ssid, setup_cfg.password, 20000);
+    /* 7-minute timeout — gives routers time to come back up after a power cut
+     * before the device gives up and falls into setup mode. */
+    ret = wifi_manager_connect_sta(setup_cfg.ssid, setup_cfg.password, 7 * 60 * 1000);
     if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Autostart: WiFi connect failed after 7 min (%s) — falling back to setup mode",
+                 esp_err_to_name(ret));
         return ret;
     }
 
-    lcd_status_show_wifi_and_broker(setup_cfg.ssid, setup_cfg.broker_ip);
+    /* Initialize syslog only after WiFi is connected to avoid interfering with AP/STA transitions */
+    ret = syslog_init(setup_cfg.broker_ip, 5140);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Syslog init failed: %s — continuing without syslog", esp_err_to_name(ret));
+    }
 
     ret = mqtt_manager_init(setup_cfg.broker_ip, setup_cfg.broker_port);
     if (ret != ESP_OK) {
@@ -650,8 +656,6 @@ esp_err_t web_portal_try_autostart_from_nvs(bool *started)
         return ret;
     }
 
-    lcd_status_show_zone_overview(zone_cfg.zone_id, zone_cfg.zone_name, "None");
-
     if (started != NULL) {
         *started = true;
     }
@@ -664,11 +668,6 @@ esp_err_t web_portal_start(void)
 {
     ESP_ERROR_CHECK(zone_config_init());
     ESP_ERROR_CHECK(setup_config_init());
-
-    esp_err_t lcd_ret = lcd_status_init();
-    if (lcd_ret != ESP_OK) {
-        ESP_LOGW(TAG, "LCD init failed, continuing without LCD: %s", esp_err_to_name(lcd_ret));
-    }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 

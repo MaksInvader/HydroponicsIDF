@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "ota_update.h"
+#include "indicator_led.h"
 
 static const char *TAG = "ota_update";
 
@@ -170,6 +171,7 @@ static void ota_http_task(void *arg)
         ESP_LOGI(TAG, "HTTP OTA success. Rebooting...");
         atomic_store(&s_ota.in_progress, false);
         vTaskDelay(pdMS_TO_TICKS(500));
+        indicator_led_startup_beep();
         esp_restart();
     } else {
         ESP_LOGE(TAG, "HTTP OTA failed: %s", esp_err_to_name(err));

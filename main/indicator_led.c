@@ -20,6 +20,7 @@
 static const char *TAG = "indicator_led";
 
 static bool           s_initialized = false;
+static bool           s_in_fault    = false;  /* true while a permanent fault is latched */
 static QueueHandle_t  s_blink_queue = NULL;
 static TaskHandle_t   s_blink_task  = NULL;
 
@@ -105,6 +106,11 @@ void indicator_led_set_connection(bool connected)
     if (!s_initialized) {
         return;
     }
+    /* During a fault the connection LED is forced OFF and must not be
+     * re-enabled by MQTT callbacks until the fault is cleared. */
+    if (s_in_fault) {
+        return;
+    }
     gpio_set_level((gpio_num_t)PIN_LED_CONNECTION, connected ? 1 : 0);
 }
 
@@ -126,12 +132,31 @@ void indicator_led_set_fault(bool on)
         return;
     }
     if (on) {
-        /* Drive immediately from this task context. */
+        s_in_fault = true;
+        /* Drive fault indicators immediately from this task context. */
         gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
         gpio_set_level((gpio_num_t)PIN_RESERVE_BINARY, 1);
+        /* Force connection LED off — it must stay off until fault is cleared. */
+        gpio_set_level((gpio_num_t)PIN_LED_CONNECTION, 0);
     } else {
+        s_in_fault = false;
         /* Send cancel so the blink task also turns it off if it's mid-blink. */
         uint32_t cancel = BLINK_CANCEL;
         xQueueSend(s_blink_queue, &cancel, 0);
     }
+}
+
+void indicator_led_startup_beep(void)
+{
+    if (!s_initialized) {
+        return;
+    }
+    /* Flash fault LED twice: ON-OFF-ON-OFF pattern */
+    gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level((gpio_num_t)PIN_LED_FAULT, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level((gpio_num_t)PIN_LED_FAULT, 0);
 }

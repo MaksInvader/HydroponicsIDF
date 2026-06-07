@@ -44,6 +44,8 @@ typedef struct {
     TickType_t valve_on_tick;
     bool valve_waiting;
     safety_fault_mask_t boot_faults;
+    int water_temp_oor_ticks; /* consecutive safety-loop ticks with temp out of range */
+    int tds_oor_ticks;        /* consecutive safety-loop ticks with TDS out of range */
 } runtime_safety_state_t;
 
 typedef struct {
@@ -148,14 +150,11 @@ static void safety_publish_faults(safety_fault_mask_t new_faults)
         }
     }
 
-    if (code != NULL && s_bindings.zone_id != NULL && s_bindings.zone_id[0] != '\0') {
-        char line[32];
-        if (count > 1) {
-            snprintf(line, sizeof(line), "FAULT %s +%d", code, count - 1);
-        } else {
-            snprintf(line, sizeof(line), "FAULT %s", code);
-        }
-        lcd_status_show_zone_overview(s_bindings.zone_id, s_bindings.zone_name, line);
+    /* Skip the fault screen if we are already in emergency/safe mode —
+     * safety_enter_safe_state() has already shown lcd_status_show_emergency()
+     * and we must not overwrite it with a generic fault code. */
+    if (code != NULL && !atomic_load(&s_safety.safe_mode)) {
+        lcd_status_show_fault(code, text != NULL ? text : "");
     }
 }
 
@@ -167,6 +166,10 @@ static void safety_enter_safe_state(safety_fault_mask_t new_faults)
     return;
 #else
     atomic_store(&s_safety.safe_mode, true);
+    lcd_status_show_emergency();
+    
+    /* Keep reserve binary on indefinitely until reset */
+    indicator_led_set_fault(true);
 
     portENTER_CRITICAL(&s_gate_lock);
     s_gate_open = false;
@@ -292,6 +295,8 @@ void runtime_safety_reset_state(void)
     s_safety.valve_on_tick = 0;
     s_safety.valve_waiting = false;
     s_safety.boot_faults = 0;
+    s_safety.water_temp_oor_ticks = 0;
+    s_safety.tds_oor_ticks = 0;
 #if !DEV_MODE
     portENTER_CRITICAL(&s_gate_lock);
     s_gate_open = false;
@@ -680,13 +685,10 @@ void runtime_safety_task(void *arg)
 
     float last_ph = 0.0f;
     float last_tds = 0.0f;
-    float last_temp = 0.0f;
     bool last_ph_valid = false;
     bool last_tds_valid = false;
-    bool last_temp_valid = false;
     int ph_frozen = 0;
     int tds_frozen = 0;
-    int temp_frozen = 0;
     TickType_t last_ph_tick = last_wake;
 
     while (s_bindings.stop_requested != NULL && !atomic_load(s_bindings.stop_requested)) {
@@ -718,30 +720,25 @@ void runtime_safety_task(void *arg)
             /* Water level is now managed by the auto-fill state machine above.
              * Only temperature and pH/TDS checks remain here. */
 
-            /* Graduated temperature response:
-             *   > SAFETY_TEMP_HIGH     -> warning only (log, no fault)
-             *   > SAFETY_TEMP_CRITICAL -> hard fault + safe mode
-             *   < SAFETY_TEMP_LOW      -> hard fault + safe mode */
-            if (snap.water_temp > SAFETY_TEMP_CRITICAL ||
-                snap.water_temp < SAFETY_TEMP_LOW) {
-                safety_fault_set(SAFETY_FAULT_WATER_TEMP, "Water temperature out of range");
-            } else if (snap.water_temp > SAFETY_TEMP_HIGH) {
-                ESP_LOGW(TAG, "Water temperature elevated: %.1f C (warn threshold %.1f C)",
-                         snap.water_temp, (float)SAFETY_TEMP_HIGH);
-            }
-
-            if (last_temp_valid) {
-                if (fabsf(snap.water_temp - last_temp) < SAFETY_TEMP_FROZEN_EPSILON) {
-                    temp_frozen++;
-                } else {
-                    temp_frozen = 0;
+            /* Water temperature out-of-range: fault after sustained OOR for
+             * SAFETY_TEMP_OOR_FAULT_MS.  Counter resets as soon as the reading
+             * returns in range or the last read was not fresh (sensor dropout).
+             * Skipped entirely when ENABLE_WATER_TEMP=0 or sensor read failed
+             * (sensor_ok is true only when the most recent DS18B20 read succeeded). */
+            if (snap.water_temp_sensor_ok &&
+                (snap.water_temp < SAFETY_TEMP_LOW || snap.water_temp > SAFETY_TEMP_HIGH)) {
+                s_safety.water_temp_oor_ticks++;
+                uint32_t oor_ms = (uint32_t)s_safety.water_temp_oor_ticks * SAFETY_INTERVAL_MS;
+                ESP_LOGW(TAG, "Water temp OOR: %.1f C (range %.1f–%.1f C, %lu/%lu ms)",
+                         snap.water_temp,
+                         (float)SAFETY_TEMP_LOW, (float)SAFETY_TEMP_HIGH,
+                         (unsigned long)oor_ms, (unsigned long)SAFETY_TEMP_OOR_FAULT_MS);
+                if (oor_ms >= SAFETY_TEMP_OOR_FAULT_MS) {
+                    safety_fault_set(SAFETY_FAULT_WATER_TEMP, "Water temp out of range >1 min");
                 }
-                if (temp_frozen >= SAFETY_TEMP_FROZEN_SAMPLES) {
-                    safety_fault_set(SAFETY_FAULT_WATER_TEMP, "Water temperature frozen");
-                }
+            } else {
+                s_safety.water_temp_oor_ticks = 0;
             }
-            last_temp = snap.water_temp;
-            last_temp_valid = true;
 
             if (SAFETY_ENABLE_PH_TDS_CHECKS) {
                 /* Only run pH checks when calibration is present and value is valid */
@@ -785,8 +782,20 @@ void runtime_safety_task(void *arg)
 
                 /* Only run TDS checks when calibration is present and value is valid */
                 if (snap.tds_valid) {
+                    /* Out-of-range: require sustained OOR for SAFETY_TDS_OOR_FAULT_MS
+                     * before faulting to avoid false trips from transient ADC noise. */
                     if (snap.tds < SAFETY_TDS_MIN || snap.tds > SAFETY_TDS_MAX) {
-                        safety_fault_set(SAFETY_FAULT_TDS_SENSOR, "TDS out of range");
+                        s_safety.tds_oor_ticks++;
+                        uint32_t oor_ms = (uint32_t)s_safety.tds_oor_ticks * SAFETY_INTERVAL_MS;
+                        ESP_LOGW(TAG, "TDS OOR: %.1f ppm (range %.0f–%.0f, %lu/%lu ms)",
+                                 snap.tds,
+                                 (float)SAFETY_TDS_MIN, (float)SAFETY_TDS_MAX,
+                                 (unsigned long)oor_ms, (unsigned long)SAFETY_TDS_OOR_FAULT_MS);
+                        if (oor_ms >= SAFETY_TDS_OOR_FAULT_MS) {
+                            safety_fault_set(SAFETY_FAULT_TDS_SENSOR, "TDS out of range >10 s");
+                        }
+                    } else {
+                        s_safety.tds_oor_ticks = 0;
                     }
 
                     if (last_tds_valid) {
@@ -883,4 +892,5 @@ void runtime_safety_task(void *arg)
     }
 
     runtime_safety_wdt_unregister();
+    vTaskDelete(NULL);  /* Task must delete itself before returning */
 }

@@ -284,6 +284,7 @@ esp_err_t mqtt_manager_init(const char *broker_ip, int broker_port)
         .network.reconnect_timeout_ms  = 5000,
         .network.disable_auto_reconnect = false,
         .session.keepalive             = 30,
+        .task.stack_size               = 8192,
     };
 
     s_client = esp_mqtt_client_init(&mqtt_cfg);

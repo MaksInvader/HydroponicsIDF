@@ -38,6 +38,12 @@
 /* Hold duration required to trigger setup mode (ms). */
 #define HOLD_REQUIRED_MS 3000
 
+/* Number of consecutive LOW samples required before the hold timer starts.
+ * Glitches shorter than DEBOUNCE_COUNT * POLL_MS (= 50 ms) are ignored.
+ * Any HIGH sample resets this counter, preventing non-consecutive LOW
+ * readings from accumulating toward the hold threshold. */
+#define DEBOUNCE_COUNT   5
+
 /* -------------------------------------------------------------------------- */
 
 void setup_button_init(void)
@@ -59,13 +65,16 @@ void setup_button_wait_for_hold(uint32_t hold_ms)
 {
     ESP_LOGI(TAG, "Waiting for setup button hold (%lu ms)...", (unsigned long)hold_ms);
 
-    uint32_t held_ticks  = 0;
-    uint32_t blink_ticks = 0;
-    int      led_state   = 0;
+    uint32_t held_ticks    = 0;
+    uint32_t blink_ticks   = 0;
+    uint32_t debounce_count = 0;   /* consecutive LOW sample counter */
+    int      led_state     = 0;
 
     /* Ensure fault LED starts LOW */
+#if ENABLE_INDICATOR_LEDS
     gpio_set_direction(PIN_LED_FAULT, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_LED_FAULT, 0);
+#endif
 
     while (held_ticks < hold_ms) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
@@ -75,20 +84,33 @@ void setup_button_wait_for_hold(uint32_t hold_ms)
         if (blink_ticks >= BLINK_HALF_MS) {
             blink_ticks = 0;
             led_state   = !led_state;
+#if ENABLE_INDICATOR_LEDS
             gpio_set_level(PIN_LED_FAULT, led_state);
+#endif
         }
 
-        /* Button is active LOW */
+        /* Debounce + hold logic:
+         *   - Any HIGH sample resets BOTH counters (glitch immunity).
+         *   - held_ticks only starts counting once DEBOUNCE_COUNT
+         *     consecutive LOW samples confirm a real press. */
         if (gpio_get_level(PIN_SETUP_BUTTON) == 0) {
-            held_ticks += POLL_MS;
+            if (debounce_count < DEBOUNCE_COUNT) {
+                debounce_count++;
+                /* Don't count hold time until pin is debounced */
+            } else {
+                held_ticks += POLL_MS;
+            }
         } else {
-            /* Released — reset hold counter but keep blinking */
-            held_ticks = 0;
+            /* Released — reset both counters */
+            debounce_count = 0;
+            held_ticks     = 0;
         }
     }
 
     /* Turn LED off when done */
+#if ENABLE_INDICATOR_LEDS
     gpio_set_level(PIN_LED_FAULT, 0);
+#endif
     ESP_LOGI(TAG, "Setup button hold detected — entering setup mode");
 }
 
@@ -98,34 +120,50 @@ static void button_monitor_task(void *arg)
 {
     (void)arg;
 
-    uint32_t held_ticks = 0;
+    /* Delay 30 seconds after boot to avoid false triggers during WiFi initialization */
+    ESP_LOGI(TAG, "Button monitor starting — 30s boot delay...");
+    vTaskDelay(pdMS_TO_TICKS(30000));
+    ESP_LOGI(TAG, "Button monitor active");
+
+    uint32_t held_ticks    = 0;
+    uint32_t debounce_count = 0;   /* consecutive LOW sample counter */
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
 
+        /* Debounce + hold logic:
+         *   - Any HIGH sample resets BOTH counters.
+         *   - held_ticks only accumulates after DEBOUNCE_COUNT consecutive
+         *     LOW samples — isolated glitches can never reach HOLD_REQUIRED_MS. */
         if (gpio_get_level(PIN_SETUP_BUTTON) == 0) {
-            held_ticks += POLL_MS;
-            if (held_ticks >= HOLD_REQUIRED_MS) {
-                ESP_LOGI(TAG, "Button held — stopping runtime and entering setup mode");
+            if (debounce_count < DEBOUNCE_COUNT) {
+                debounce_count++;
+            } else {
+                held_ticks += POLL_MS;
+                if (held_ticks >= HOLD_REQUIRED_MS) {
+                    ESP_LOGI(TAG, "Button held — stopping runtime and entering setup mode");
 
-                runtime_tasks_stop();
+                    runtime_tasks_stop();
 
-                esp_err_t ret = wifi_manager_start_ap("ESP32S3-Updater", NULL);
-                if (ret != ESP_OK) {
-                    ESP_LOGE(TAG, "Failed to start setup AP: %s", esp_err_to_name(ret));
+                    esp_err_t ret = wifi_manager_start_ap("ESP32S3-Updater", NULL);
+                    if (ret != ESP_OK) {
+                        ESP_LOGE(TAG, "Failed to start setup AP: %s", esp_err_to_name(ret));
+                    }
+
+                    ret = web_portal_start();
+                    if (ret != ESP_OK) {
+                        ESP_LOGE(TAG, "Failed to start web portal: %s", esp_err_to_name(ret));
+                    }
+
+                    /* Portal and restart-after-configure task take over from here */
+                    vTaskDelete(NULL);
+                    return;
                 }
-
-                ret = web_portal_start();
-                if (ret != ESP_OK) {
-                    ESP_LOGE(TAG, "Failed to start web portal: %s", esp_err_to_name(ret));
-                }
-
-                /* Portal and restart-after-configure task take over from here */
-                vTaskDelete(NULL);
-                return;
             }
         } else {
-            held_ticks = 0;
+            /* Released — reset both counters */
+            debounce_count = 0;
+            held_ticks     = 0;
         }
     }
 }
@@ -133,7 +171,7 @@ static void button_monitor_task(void *arg)
 void setup_button_start_monitor(void)
 {
     BaseType_t ret = xTaskCreate(button_monitor_task, "btn_monitor",
-                                 2048, NULL, 3, NULL);
+                                 4096, NULL, 3, NULL);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create button monitor task");
     } else {

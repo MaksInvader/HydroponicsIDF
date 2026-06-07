@@ -1,0 +1,10 @@
+key,type,encoding,value
+setup_cfg,namespace,,
+ssid,data,string,IOT@difziqco
+password,data,string,H4d1fH4z1q
+broker_ip,data,string,192.168.0.100
+broker_port,data,i32,1883
+ota_broker_ip,data,string,
+zone_cfg,namespace,,
+zone_id,data,string,peremejaan_1
+zone_name,data,string,peremejaan_1

@@ -28,21 +28,23 @@
 
 /* Dosing supervision */
 #define SAFETY_DOSE_WINDOW_MS 300000
-#define SAFETY_MAX_DOSE_A_MS 30000
-#define SAFETY_MAX_DOSE_B_MS 30000
-#define SAFETY_MAX_DOSE_PH_UP_MS 15000
-#define SAFETY_MAX_DOSE_PH_DOWN_MS 15000
+#define SAFETY_MAX_DOSE_A_MS 120000       /* 2 min — large tank needs more nutrient */
+#define SAFETY_MAX_DOSE_B_MS 120000       /* 2 min */
+#define SAFETY_MAX_DOSE_PH_UP_MS 60000    /* 1 min */
+#define SAFETY_MAX_DOSE_PH_DOWN_MS 60000  /* 1 min */
 
 /* Valve ON timeout — server is responsible for closing the valve.
  * If the valve remains ON longer than this, a fill-timeout fault is latched. */
-#define SAFETY_FILL_TIMEOUT_MS          120000 /* 2 minutes */
+#define SAFETY_FILL_TIMEOUT_MS          600000 /* 10 minutes — large tank */
 
 /* Temperature checks (Celsius) */
 #define SAFETY_TEMP_LOW 10.0f
 #define SAFETY_TEMP_HIGH 36.0f
 #define SAFETY_TEMP_CRITICAL 42.0f
-#define SAFETY_TEMP_FROZEN_EPSILON 0.02f
-#define SAFETY_TEMP_FROZEN_SAMPLES 20
+
+/* Water temp out-of-range fault: fault is latched if the reading stays
+ * outside [SAFETY_TEMP_LOW, SAFETY_TEMP_HIGH] continuously for this long. */
+#define SAFETY_TEMP_OOR_FAULT_MS 60000   /* 1 minute */
 
 /* pH / TDS checks */
 #define SAFETY_ENABLE_PH_TDS_CHECKS 1
@@ -53,14 +55,15 @@
 #define SAFETY_PH_CRITICAL_HIGH 9.0f
 #define SAFETY_PH_RATE_MAX_PER_MIN 1.0f
 #define SAFETY_PH_FROZEN_EPSILON 0.005f
-#define SAFETY_PH_FROZEN_SAMPLES 20
+#define SAFETY_PH_FROZEN_SAMPLES 300      /* 150 s — large volume, slow pH drift */
 #define SAFETY_PH_RESPONSE_TIMEOUT_MS 90000
 #define SAFETY_PH_RESPONSE_MIN_DELTA 0.03f
 
 #define SAFETY_TDS_MIN 50.0f
 #define SAFETY_TDS_MAX 2500.0f
 #define SAFETY_TDS_FROZEN_EPSILON 0.5f
-#define SAFETY_TDS_FROZEN_SAMPLES 20
+#define SAFETY_TDS_FROZEN_SAMPLES 300     /* 150 s — large volume, slow TDS drift */
+#define SAFETY_TDS_OOR_FAULT_MS   10000   /* Require OOR for 10 s continuously before faulting */
 #define SAFETY_TDS_RESPONSE_TIMEOUT_MS 120000
 #define SAFETY_TDS_RESPONSE_MIN_DELTA 5.0f
 

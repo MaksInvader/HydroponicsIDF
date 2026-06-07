@@ -41,6 +41,7 @@ typedef struct {
 	uint32_t pulse_ms;
 } actuator_command_t;
 
+esp_err_t actuator_control_early_gpio_init(void);
 esp_err_t actuator_control_init(const char *zone_id);
 esp_err_t actuator_control_deinit(void);
 esp_err_t actuator_control_apply_state(actuator_channel_t channel, bool is_on);

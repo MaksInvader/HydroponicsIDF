@@ -12,7 +12,9 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define MAXIMUM_RETRY 10
+/* Set high enough that the timeout in xEventGroupWaitBits is the sole
+ * termination condition for the initial connect sequence. */
+#define MAXIMUM_RETRY 999
 
 static const char *TAG = "wifi_manager";
 
@@ -23,6 +25,7 @@ static esp_netif_t *s_sta_netif;
 static bool s_connect_sequence_active;
 static bool s_sta_auto_reconnect_enabled;
 static bool s_event_handlers_registered;
+static bool s_wifi_started;
 static esp_event_handler_instance_t s_instance_any_id;
 static esp_event_handler_instance_t s_instance_got_ip;
 
@@ -43,7 +46,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         if (s_connect_sequence_active && s_retry_num < MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(TAG, "Retry connecting to AP (%d/%d)", s_retry_num, MAXIMUM_RETRY);
+            ESP_LOGI(TAG, "WiFi: retry %d (will keep trying until timeout)", s_retry_num);
         } else if (s_connect_sequence_active) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         } else if (s_sta_auto_reconnect_enabled) {
@@ -132,9 +135,17 @@ esp_err_t wifi_manager_start_ap(const char *ap_ssid, const char *ap_password)
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
+    /* Stop Wi-Fi first if already running — mode change requires a restart */
+    if (s_wifi_started) {
+        s_sta_auto_reconnect_enabled = false;
+        esp_wifi_stop();
+        s_wifi_started = false;
+    }
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    s_wifi_started = true;
 
     ESP_LOGI(TAG, "AP started. SSID: %s", ap_ssid);
     return ESP_OK;
@@ -183,8 +194,28 @@ esp_err_t wifi_manager_connect_sta(const char *ssid, const char *password, int t
 
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    s_connect_sequence_active = true;
-    ESP_ERROR_CHECK(esp_wifi_connect());
+
+    /* Optional static IP — uncomment and set values to bypass DHCP
+    esp_netif_dhcpc_stop(s_sta_netif);
+    esp_netif_ip_info_t ip_info = {0};
+    IP4_ADDR(&ip_info.ip,      192, 168, 1, 200);
+    IP4_ADDR(&ip_info.gw,      192, 168, 1,   1);
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+    esp_netif_set_ip_info(s_sta_netif, &ip_info);
+    */
+
+    if (!s_wifi_started) {
+        /* Autostart path: WiFi has never been started. Set STA mode and start.
+         * WIFI_EVENT_STA_START will fire and the event handler will call
+         * esp_wifi_connect() automatically since s_connect_sequence_active=true. */
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        s_connect_sequence_active = true;
+        ESP_ERROR_CHECK(esp_wifi_start());
+        s_wifi_started = true;
+    } else {
+        s_connect_sequence_active = true;
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    }
 
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_event_group,

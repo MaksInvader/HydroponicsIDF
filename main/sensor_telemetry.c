@@ -44,6 +44,22 @@
 #include "pin_config.h"
 #include "sensor_calibration_nvs.h"
 #include "sensor_telemetry.h"
+#include "i2c_bus.h"
+
+#if (PH_SOURCE_USE_SERIAL == 1)
+#include "ph_serial.h"
+#endif
+
+/* Water-level debounce: a HIGH→LOW transition is only committed after the
+ * level has been continuously LOW for this many milliseconds — but ONLY
+ * when the LOW follows a short HIGH (bounce). A sustained clean LOW
+ * (HIGH lasted longer than WATER_LEVEL_BOUNCE_WINDOW_MS) commits immediately. */
+#define WATER_LEVEL_DEBOUNCE_LOW_MS  5000
+
+/* A HIGH→LOW transition is considered a bounce only if the preceding HIGH
+ * lasted less than this many milliseconds.  Any HIGH longer than this is
+ * treated as a stable level, so the subsequent LOW commits immediately. */
+#define WATER_LEVEL_BOUNCE_WINDOW_MS  200
 
 /* --------------------------------------------------------------------------
  * Tunables
@@ -52,8 +68,20 @@
 /** Rolling window depth for the per-sensor moving average (all sensors). */
 #define SENSOR_SAMPLE_WINDOW    30
 
+/** Consecutive DS18B20 read failures before water_temp_sensor_ok is cleared. */
+#define SENSOR_TEMP_FAIL_THRESHOLD  100
+
 /** DS18B20 12-bit conversion time in milliseconds. */
 #define DS18B20_CONVERSION_MS   750
+
+/** Consecutive 1-Wire failures before triggering bus reinit (backoff strategy).
+ * Prevents aggressive reinit attempts that may stress the bus further. */
+#define OW_REINIT_AFTER_N_FAILURES  5
+
+/** After the sensor has been declared dead (fail count >= SENSOR_TEMP_FAIL_THRESHOLD),
+ * attempt a full bus reinit every this many samples to self-recover without
+ * requiring a device restart (~5 min at 2-second sample rate). */
+#define OW_DEAD_RETRY_INTERVAL      150
 
 /** Valid physical ranges — readings outside these mark the reading invalid. */
 #define PH_VALUE_MIN            0.0f
@@ -134,6 +162,10 @@ static bool                       s_ow_ready  = false;
 /* true after the first conversion trigger; read is deferred to next cycle */
 static bool                       s_ow_conversion_pending = false;
 static bool                       s_initialized;
+static int                        s_temp_fail_count = 0;  /* consecutive DS18B20 read failures */
+static int                        s_ow_reinit_fail_count = 0;  /* consecutive failures before reinit */
+static bool                       s_temp_read_fresh = false; /* true only if last read succeeded */
+static int                        s_ow_dead_retry_count = 0;  /* samples elapsed since sensor declared dead */
 
 /* ADS1115 I2C handle state */
 static bool s_ads1115_ready = false;
@@ -148,7 +180,9 @@ static float  s_temp_history[SENSOR_SAMPLE_WINDOW];
 static float  s_ph_history[SENSOR_SAMPLE_WINDOW];
 static float  s_tds_history[SENSOR_SAMPLE_WINDOW];
 static size_t s_history_index;
-static size_t s_history_count;
+static size_t s_temp_history_count;
+static size_t s_ph_history_count;
+static size_t s_tds_history_count;
 
 /* Calibration state (protected by s_cali_lock) */
 static calibration_t s_ph_cali;
@@ -157,6 +191,13 @@ static calibration_t s_tds_cali;
 /* Deferred publish flags — set when MQTT was not connected at boot */
 static bool s_ph_pub_pending;
 static bool s_tds_pub_pending;
+
+/* Water-level debounce state */
+static esp_timer_handle_t s_wl_debounce_timer  = NULL;
+static portMUX_TYPE       s_wl_debounce_lock   = portMUX_INITIALIZER_UNLOCKED;
+static int                s_wl_debounced_level = 1;   /* last committed level */
+static bool               s_wl_low_pending     = false;
+static TickType_t         s_wl_last_high_tick  = 0;   /* tick when level last went/stayed HIGH */
 
 /* --------------------------------------------------------------------------
  * Forward declarations
@@ -170,6 +211,115 @@ static void on_mqtt_connected(bool connected, void *user_ctx);
 /* --------------------------------------------------------------------------
  * Utilities
  * -------------------------------------------------------------------------- */
+
+static void wl_debounce_timer_cb(void *arg)
+{
+    (void)arg;
+    portENTER_CRITICAL(&s_wl_debounce_lock);
+    bool commit = s_wl_low_pending;
+    if (commit) {
+        s_wl_debounced_level = 0;
+        s_wl_low_pending     = false;
+    }
+    portEXIT_CRITICAL(&s_wl_debounce_lock);
+    if (commit) {
+        ESP_LOGI(TAG, "WaterLevel debounce elapsed — committing LOW");
+    }
+}
+
+static void wl_debounce_init(void)
+{
+    if (s_wl_debounce_timer != NULL) return;
+    esp_timer_create_args_t args = {
+        .callback        = wl_debounce_timer_cb,
+        .arg             = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "wl_debounce",
+    };
+    esp_timer_create(&args, &s_wl_debounce_timer);
+}
+
+static void wl_debounce_deinit(void)
+{
+    if (s_wl_debounce_timer == NULL) return;
+    esp_timer_stop(s_wl_debounce_timer);
+    esp_timer_delete(s_wl_debounce_timer);
+    s_wl_debounce_timer = NULL;
+    portENTER_CRITICAL(&s_wl_debounce_lock);
+    s_wl_low_pending     = false;
+    s_wl_debounced_level = 1;
+    s_wl_last_high_tick  = xTaskGetTickCount();
+    portEXIT_CRITICAL(&s_wl_debounce_lock);
+}
+
+/* Returns the debounced water level.
+ *
+ * HIGH (1) — committed immediately; records the tick; cancels any pending LOW timer.
+ *
+ * LOW  (0) — two cases:
+ *   Stable LOW: the preceding HIGH lasted > WATER_LEVEL_BOUNCE_WINDOW_MS.
+ *               Committed immediately — no timer needed.
+ *   Bouncy LOW: the preceding HIGH lasted ≤ WATER_LEVEL_BOUNCE_WINDOW_MS.
+ *               Deferred for WATER_LEVEL_DEBOUNCE_LOW_MS; reports HIGH until
+ *               the timer fires (same as the original behaviour). */
+static int wl_debounce_filter(int raw_level)
+{
+    if (raw_level == 1) {
+        portENTER_CRITICAL(&s_wl_debounce_lock);
+        bool was_pending     = s_wl_low_pending;
+        s_wl_low_pending     = false;
+        s_wl_debounced_level = 1;
+        s_wl_last_high_tick  = xTaskGetTickCount();
+        portEXIT_CRITICAL(&s_wl_debounce_lock);
+        if (was_pending && s_wl_debounce_timer != NULL) {
+            esp_timer_stop(s_wl_debounce_timer);
+        }
+        return 1;
+    }
+
+    /* raw_level == 0 */
+    portENTER_CRITICAL(&s_wl_debounce_lock);
+    int  current         = s_wl_debounced_level;
+    bool already_pending = s_wl_low_pending;
+    TickType_t last_high = s_wl_last_high_tick;
+    portEXIT_CRITICAL(&s_wl_debounce_lock);
+
+    if (current == 0) {
+        return 0; /* already committed LOW */
+    }
+
+    /* Determine whether the preceding HIGH was stable or a bounce. */
+    uint32_t high_duration_ms = (uint32_t)((xTaskGetTickCount() - last_high) * (TickType_t)portTICK_PERIOD_MS);
+    bool is_bounce = (high_duration_ms <= WATER_LEVEL_BOUNCE_WINDOW_MS);
+
+    if (!is_bounce) {
+        /* Stable HIGH→LOW: commit immediately, no timer needed. */
+        portENTER_CRITICAL(&s_wl_debounce_lock);
+        s_wl_low_pending = true;
+        s_wl_debounced_level = 0;
+        s_wl_low_pending     = false;
+        portEXIT_CRITICAL(&s_wl_debounce_lock);
+        ESP_LOGI(TAG, "WaterLevel HIGH→LOW (stable, %lu ms HIGH) — committing immediately",
+                 (unsigned long)high_duration_ms);
+        return 0;
+    }
+
+    /* Bouncy HIGH→LOW: start debounce timer if not already running */
+    if (!already_pending) {
+        portENTER_CRITICAL(&s_wl_debounce_lock);
+        s_wl_low_pending = true;
+        portEXIT_CRITICAL(&s_wl_debounce_lock);
+        if (s_wl_debounce_timer != NULL) {
+            esp_timer_stop(s_wl_debounce_timer);
+            esp_timer_start_once(s_wl_debounce_timer,
+                                 (uint64_t)WATER_LEVEL_DEBOUNCE_LOW_MS * 1000ULL);
+        }
+        ESP_LOGI(TAG, "WaterLevel HIGH→LOW (bounce, %lu ms HIGH) — deferring for %d ms",
+                 (unsigned long)high_duration_ms, WATER_LEVEL_DEBOUNCE_LOW_MS);
+    }
+
+    return 1; /* report HIGH until timer fires */
+}
 
 static float average_window(const float *values, size_t count)
 {
@@ -185,8 +335,10 @@ static void reset_state_locked(void)
     memset(s_temp_history, 0, sizeof(s_temp_history));
     memset(s_ph_history,   0, sizeof(s_ph_history));
     memset(s_tds_history,  0, sizeof(s_tds_history));
-    s_history_index = 0;
-    s_history_count = 0;
+    s_history_index      = 0;
+    s_temp_history_count = 0;
+    s_ph_history_count   = 0;
+    s_tds_history_count  = 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -243,6 +395,61 @@ static void ow_init(void)
 }
 
 /**
+ * @brief  Tear down the 1-Wire bus and DS18B20 device handles.
+ * Safe to call even if init never completed — checks each handle before deleting.
+ */
+static void ow_deinit(void)
+{
+    s_ow_ready              = false;
+    s_ow_conversion_pending = false;
+
+    if (s_ds18b20 != NULL) {
+        ds18b20_del_device(s_ds18b20);
+        s_ds18b20 = NULL;
+    }
+    if (s_ow_bus != NULL) {
+        onewire_bus_del(s_ow_bus);
+        s_ow_bus = NULL;
+    }
+}
+
+/**
+ * @brief  Tear down and re-initialise the 1-Wire bus after a read error.
+ * A short delay lets the RMT peripheral fully release its resources before
+ * the new bus handle is created.
+ */
+static void ow_reinit(void)
+{
+    ESP_LOGW(TAG, "DS18B20 reinit — tearing down 1-Wire bus");
+    ow_deinit();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Reset ALL failure counters unconditionally BEFORE attempting init.
+     * This prevents a reinit storm: without this, a failed reinit leaves
+     * s_ow_reinit_fail_count >= OW_REINIT_AFTER_N_FAILURES, so the very
+     * next trigger failure immediately calls ow_reinit() again instead of
+     * allowing the 5-failure backoff window to apply fresh. */
+    s_ow_reinit_fail_count = 0;
+    s_temp_fail_count      = 0;
+    s_ow_dead_retry_count  = 0;
+
+    ow_init();
+    if (s_ow_ready) {
+        /* Trigger a fresh conversion so the next sample cycle has a result */
+        esp_err_t ret = ds18b20_trigger_temperature_conversion(s_ds18b20);
+        if (ret == ESP_OK) {
+            s_ow_conversion_pending = true;
+            ESP_LOGI(TAG, "DS18B20 reinit succeeded");
+        } else {
+            ESP_LOGE(TAG, "DS18B20 reinit: trigger failed: %s", esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGE(TAG, "DS18B20 reinit failed — will retry in %d samples",
+                 OW_DEAD_RETRY_INTERVAL);
+    }
+}
+
+/**
  * @brief  Trigger a DS18B20 temperature conversion (non-blocking).
  *
  * Call at the END of a sampling cycle.  The result will be ready after
@@ -255,9 +462,19 @@ static void ow_trigger_conversion(void)
     esp_err_t ret = ds18b20_trigger_temperature_conversion(s_ds18b20);
     if (ret == ESP_OK) {
         s_ow_conversion_pending = true;
+        s_ow_reinit_fail_count = 0;  /* success — reset backoff counter */
     } else {
-        ESP_LOGW(TAG, "DS18B20 conversion trigger failed: %s", esp_err_to_name(ret));
         s_ow_conversion_pending = false;
+        s_ow_reinit_fail_count++;
+        if (s_ow_reinit_fail_count >= OW_REINIT_AFTER_N_FAILURES) {
+            ESP_LOGW(TAG, "DS18B20 conversion trigger failed %d times: %s — reinitialising",
+                     s_ow_reinit_fail_count, esp_err_to_name(ret));
+            ow_reinit();
+        } else {
+            ESP_LOGD(TAG, "DS18B20 conversion trigger failed (%d/%d): %s — will retry",
+                     s_ow_reinit_fail_count, OW_REINIT_AFTER_N_FAILURES,
+                     esp_err_to_name(ret));
+        }
     }
 }
 
@@ -266,6 +483,8 @@ static void ow_trigger_conversion(void)
  *
  * Call at the START of a sampling cycle (after the previous cycle triggered).
  * Returns ESP_ERR_INVALID_STATE if no conversion was pending.
+ * On read failure, triggers a bus reinit and returns ESP_FAIL so the caller
+ * falls back to the rolling average for this cycle.
  */
 static esp_err_t sample_water_temp(float *temp_c)
 {
@@ -276,7 +495,22 @@ static esp_err_t sample_water_temp(float *temp_c)
     if (!s_ow_conversion_pending)         return ESP_ERR_INVALID_STATE;
 
     s_ow_conversion_pending = false;
-    return ds18b20_get_temperature(s_ds18b20, temp_c);
+    esp_err_t ret = ds18b20_get_temperature(s_ds18b20, temp_c);
+    if (ret != ESP_OK) {
+        s_ow_reinit_fail_count++;
+        if (s_ow_reinit_fail_count >= OW_REINIT_AFTER_N_FAILURES) {
+            ESP_LOGW(TAG, "DS18B20 read failed %d times (%s) — reinitialising",
+                     s_ow_reinit_fail_count, esp_err_to_name(ret));
+            ow_reinit();
+        } else {
+            ESP_LOGD(TAG, "DS18B20 read failed (%d/%d): %s — will retry",
+                     s_ow_reinit_fail_count, OW_REINIT_AFTER_N_FAILURES,
+                     esp_err_to_name(ret));
+        }
+        return ESP_FAIL; /* caller uses last-known-good from rolling average */
+    }
+    s_ow_reinit_fail_count = 0;  /* success — reset backoff counter */
+    return ESP_OK;
 }
 
 /* --------------------------------------------------------------------------
@@ -289,14 +523,17 @@ static esp_err_t sample_water_temp(float *temp_c)
 
 /* Config register bits */
 #define ADS1115_OS_SINGLE       (1u << 15)  /* start single conversion      */
-#define ADS1115_MUX_AIN0_GND   (4u << 12)  /* AIN0 vs GND                  */
-#define ADS1115_MUX_AIN1_GND   (5u << 12)  /* AIN1 vs GND                  */
+#define ADS1115_MUX_AIN0_GND    (4u << 12)  /* AIN0 vs GND — unused         */
+#define ADS1115_MUX_AIN1_GND    (5u << 12)  /* AIN1 vs GND — TDS            */
 #define ADS1115_PGA_4096        (1u << 9)   /* ±4.096 V FSR                 */
 #define ADS1115_MODE_SINGLE     (1u << 8)   /* single-shot mode             */
-#define ADS1115_DR_128SPS       (4u << 5)   /* 128 samples/s                */
+#define ADS1115_DR_128SPS       (4u << 5)   /* 128 samples/s (DR[2:0]=100)  */
 #define ADS1115_COMP_DISABLE    (3u << 0)   /* disable comparator           */
 
-#define ADS1115_CONVERSION_MS   10          /* ~8 ms at 128 SPS + margin    */
+#define ADS1115_CONVERSION_MS   80      /* ~8 ms at 128 SPS + margin    */
+
+/* Number of ADC samples taken per pH reading — median of these is used */
+#define PH_MEDIAN_SAMPLES  5
 
 /**
  * @brief  Initialise the I2C master for the ADS1115.
@@ -312,9 +549,12 @@ static esp_err_t ads1115_init(void)
         .scl_io_num       = PIN_ADS1115_I2C_SCL,
         .sda_pullup_en    = GPIO_PULLUP_ENABLE,
         .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 100000,
+        .master.clk_speed = 50000,
         .clk_flags        = 0,
     };
+    /* Ensure the shared bus mutex exists before any I2C access */
+    i2c_bus_init();
+
     esp_err_t ret = i2c_param_config(PIN_ADS1115_I2C_PORT, &conf);
     if (ret != ESP_OK) return ret;
 
@@ -339,8 +579,13 @@ static esp_err_t ads1115_init(void)
         (uint8_t)(cfg >> 8),
         (uint8_t)(cfg & 0xFF),
     };
+    if (i2c_bus_lock(pdMS_TO_TICKS(500)) != ESP_OK) {
+        ESP_LOGE(TAG, "ADS1115 init: I2C bus lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
     ret = i2c_master_write_to_device(PIN_ADS1115_I2C_PORT, PIN_ADS1115_I2C_ADDR,
                                      buf, sizeof(buf), pdMS_TO_TICKS(50));
+    i2c_bus_unlock();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ADS1115 not found at 0x%02X: %s",
                  PIN_ADS1115_I2C_ADDR, esp_err_to_name(ret));
@@ -350,6 +595,34 @@ static esp_err_t ads1115_init(void)
     s_ads1115_ready = true;
     ESP_LOGI(TAG, "ADS1115 ready at I2C addr 0x%02X", PIN_ADS1115_I2C_ADDR);
     return ESP_OK;
+}
+
+/**
+ * @brief  Tear down the I2C driver for the ADS1115.
+ * Safe to call even if init never completed.
+ */
+static void ads1115_deinit(void)
+{
+    s_ads1115_ready = false;
+    /* Do NOT delete the I2C driver — it is shared with the LCD.
+     * The LCD owns the driver lifetime; we only mark ourselves not ready. */
+}
+
+/**
+ * @brief  Tear down and re-initialise the ADS1115 I2C driver after a read error.
+ * A short delay lets the I2C bus settle before reinitialising.
+ */
+static void ads1115_reinit(void)
+{
+    ESP_LOGW(TAG, "ADS1115 reinit — resetting I2C driver");
+    ads1115_deinit();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_err_t ret = ads1115_init();
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "ADS1115 reinit succeeded");
+    } else {
+        ESP_LOGE(TAG, "ADS1115 reinit failed: %s — will retry next cycle", esp_err_to_name(ret));
+    }
 }
 
 /**
@@ -363,7 +636,12 @@ static esp_err_t ads1115_read_channel(uint16_t mux_bits, int *out_raw)
 {
     if (!s_ads1115_ready || out_raw == NULL) return ESP_ERR_INVALID_STATE;
 
-    /* Write config: start single-shot conversion on requested channel */
+    /* --- Phase 1: write config register (start conversion) --- */
+    if (i2c_bus_lock(pdMS_TO_TICKS(500)) != ESP_OK) {
+        ESP_LOGW(TAG, "ADS1115 read: I2C bus lock timeout (write phase)");
+        return ESP_ERR_TIMEOUT;
+    }
+
     uint16_t cfg = ADS1115_OS_SINGLE | mux_bits | ADS1115_PGA_4096 |
                    ADS1115_MODE_SINGLE | ADS1115_DR_128SPS |
                    ADS1115_COMP_DISABLE;
@@ -376,19 +654,40 @@ static esp_err_t ads1115_read_channel(uint16_t mux_bits, int *out_raw)
                                                PIN_ADS1115_I2C_ADDR,
                                                wr, sizeof(wr),
                                                pdMS_TO_TICKS(50));
-    if (ret != ESP_OK) return ret;
+    i2c_bus_unlock();
 
-    /* Wait for conversion to complete */
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ADS1115 write failed (%s) — reinitialising", esp_err_to_name(ret));
+        ads1115_reinit();
+        return ESP_FAIL;
+    }
+
+    /* --- Phase 2: wait for conversion — mutex released, bus is free --- */
     vTaskDelay(pdMS_TO_TICKS(ADS1115_CONVERSION_MS));
 
-    /* Point to conversion register */
+    /* --- Phase 3: read conversion result --- */
+    if (i2c_bus_lock(pdMS_TO_TICKS(500)) != ESP_OK) {
+        ESP_LOGW(TAG, "ADS1115 read: I2C bus lock timeout (read phase)");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* i2c_master_write_read_device sends the register address byte before
+     * reading, so the ADS1115 register pointer is always explicitly set to
+     * ADS1115_REG_CONVERSION regardless of what other transactions occurred
+     * during the conversion wait. */
     uint8_t reg = ADS1115_REG_CONVERSION;
     uint8_t rd[2] = {0};
     ret = i2c_master_write_read_device(PIN_ADS1115_I2C_PORT,
                                        PIN_ADS1115_I2C_ADDR,
                                        &reg, 1, rd, 2,
                                        pdMS_TO_TICKS(50));
-    if (ret != ESP_OK) return ret;
+    i2c_bus_unlock();
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ADS1115 read failed (%s) — reinitialising", esp_err_to_name(ret));
+        ads1115_reinit();
+        return ESP_FAIL;
+    }
 
     int16_t raw = (int16_t)((rd[0] << 8) | rd[1]);
     /* Single-ended: clamp negatives to 0 */
@@ -396,15 +695,93 @@ static esp_err_t ads1115_read_channel(uint16_t mux_bits, int *out_raw)
     return ESP_OK;
 }
 
+#if (PH_SOURCE_USE_SERIAL == 2)
+/**
+ * @brief  Read PH_MEDIAN_SAMPLES pH ADC values and return the median.
+ *
+ * Filters out spike noise from the pH analog front-end.
+ * Returns ESP_FAIL immediately if any individual read fails.
+ */
+static esp_err_t ads1115_read_ph_median(int *out_raw)
+{
+    if (out_raw == NULL) return ESP_ERR_INVALID_ARG;
+
+    int samples[PH_MEDIAN_SAMPLES];
+    for (int i = 0; i < PH_MEDIAN_SAMPLES; i++) {
+        esp_err_t ret = ads1115_read_channel(ADS1115_MUX_AIN1_GND, &samples[i]);
+        if (ret != ESP_OK) return ret;
+    }
+
+    /* Insertion sort — tiny fixed array, no need for qsort */
+    for (int i = 1; i < PH_MEDIAN_SAMPLES; i++) {
+        int key = samples[i];
+        int j   = i - 1;
+        while (j >= 0 && samples[j] > key) {
+            samples[j + 1] = samples[j];
+            j--;
+        }
+        samples[j + 1] = key;
+    }
+
+    *out_raw = samples[PH_MEDIAN_SAMPLES / 2];  /* middle element = median */
+    return ESP_OK;
+}
+#endif /* PH_SOURCE_USE_SERIAL == 2 */
+
+/* --------------------------------------------------------------------------
+ * TDS median read — always compiled (TDS always uses ADS1115 AIN1)
+ * -------------------------------------------------------------------------- */
+
+/* Number of ADC samples taken per TDS reading — median is used to reject
+ * impulse noise from the conductivity probe and pump switching interference. */
+#define TDS_MEDIAN_SAMPLES 3
+
+/**
+ * @brief  Read TDS_MEDIAN_SAMPLES TDS ADC values and return the median.
+ *
+ * Mirrors ads1115_read_ph_median() but uses ADS1115_MUX_AIN1_GND (TDS channel).
+ * Returns ESP_FAIL on the first failing individual read — caller treats the
+ * entire batch as failed so no partial data enters the history.
+ */
+static esp_err_t ads1115_read_tds_median(int *out_raw)
+{
+    if (out_raw == NULL) return ESP_ERR_INVALID_ARG;
+
+    int samples[TDS_MEDIAN_SAMPLES];
+    for (int i = 0; i < TDS_MEDIAN_SAMPLES; i++) {
+        esp_err_t ret = ads1115_read_channel(ADS1115_MUX_AIN1_GND, &samples[i]);
+        if (ret != ESP_OK) return ret;
+    }
+
+    /* Insertion sort — fixed-size array, no qsort needed */
+    for (int i = 1; i < TDS_MEDIAN_SAMPLES; i++) {
+        int key = samples[i];
+        int j   = i - 1;
+        while (j >= 0 && samples[j] > key) {
+            samples[j + 1] = samples[j];
+            j--;
+        }
+        samples[j + 1] = key;
+    }
+
+    *out_raw = samples[TDS_MEDIAN_SAMPLES / 2];  /* middle element = median */
+    return ESP_OK;
+}
+
+
 /* --------------------------------------------------------------------------
  * Calibration application
  * -------------------------------------------------------------------------- */
 
+#if (PH_SOURCE_USE_SERIAL == 2)
 /**
  * @brief  Apply a linear calibration to an ADC raw count and validate.
  *
  * The linear model maps the raw ADC count to a physical value via the stored
  * slope/offset coefficients: value = slope * raw + offset.
+ *
+ * Used only by the ADS1115 pH path (PH_SOURCE_USE_SERIAL == 2).
+ * Serial pH and TDS do inline calibration for their specific needs.
  *
  * @param  cali      Calibration coefficients (may be invalid).
  * @param  adc_raw   Raw ADC reading (0–4095 for 12-bit).
@@ -435,6 +812,7 @@ static void apply_adc_calibration_and_validate(const calibration_t *cali,
     out->value = computed;
     out->valid = true;
 }
+#endif /* PH_SOURCE_USE_SERIAL == 2 */
 
 /* --------------------------------------------------------------------------
  * Water temperature — stale ADC stub removed; DS18B20 implementation above.
@@ -492,19 +870,33 @@ static esp_err_t ensure_sensor_interfaces(void)
     esp_err_t ret = gpio_config(&level_cfg);
     if (ret != ESP_OK) return ret;
 
+    #if (ENABLE_TDS_SENSOR || (PH_SOURCE_USE_SERIAL == 2))
     /* pH and TDS — ADS1115 16-bit ADC over I2C */
     ret = ads1115_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ADS1115 init failed: %s", esp_err_to_name(ret));
         return ret;
     }
+    #endif
 
+    #if (PH_SOURCE_USE_SERIAL == 1)
+        /* Serial pH module — fatal if init fails because this mode was explicitly chosen */
+        ret = ph_serial_init();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "pH serial init failed: %s — cannot continue in serial mode",
+                     esp_err_to_name(ret));
+            return ret;
+        }
+    #endif
+
+    #if ENABLE_WATER_TEMP
     /* DS18B20 1-Wire (water temperature) */
     ow_init();
 
     /* Trigger the first conversion immediately so the very first
      * sample_water_temp() call one cycle later has a result ready. */
     ow_trigger_conversion();
+    #endif
 
     return ESP_OK;
 }
@@ -762,7 +1154,14 @@ static bool validate_cali_payload(const char *payload, int payload_len,
     out->slope      = slope;
     out->offset     = offset;
     out->valid      = true;
-    out->updated_at = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        /* Prefer the timestamp supplied by the sender (Unix epoch seconds).
+         * Fall back to a boot-relative counter only when the field is absent. */
+        float upd_f = 0.0f;
+        if (json_get_float(buf, "updated_at", &upd_f) && upd_f > 0.0f) {
+            out->updated_at = (uint32_t)upd_f;
+        } else {
+            out->updated_at = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        }
     return true;
 }
 
@@ -1094,6 +1493,9 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
     }
 
     s_initialized = true;
+    #if ENABLE_WATER_LEVEL
+    wl_debounce_init();
+    #endif
     ESP_LOGI(TAG, "Sensor telemetry initialized for zone: %s", zone_id);
     return ESP_OK;
 }
@@ -1104,20 +1506,16 @@ esp_err_t sensor_telemetry_deinit(void)
     if (s_topics.cali_ph_set[0]  != '\0') mqtt_manager_unsubscribe(s_topics.cali_ph_set);
     if (s_topics.cali_tds_set[0] != '\0') mqtt_manager_unsubscribe(s_topics.cali_tds_set);
 
-    s_ads1115_ready = false;
+    #if (ENABLE_TDS_SENSOR || (PH_SOURCE_USE_SERIAL == 2))
+    ads1115_deinit();
+    #endif
+    #if ENABLE_WATER_TEMP
+    ow_deinit();
+    #endif
 
-    if (s_ds18b20 != NULL) {
-        ds18b20_del_device(s_ds18b20);
-        s_ds18b20 = NULL;
-    }
-
-    if (s_ow_bus != NULL) {
-        onewire_bus_del(s_ow_bus);
-        s_ow_bus = NULL;
-    }
-
-    s_ow_ready              = false;
-    s_ow_conversion_pending = false;
+    #if (PH_SOURCE_USE_SERIAL == 1)
+        ph_serial_deinit();
+    #endif
 
     portENTER_CRITICAL(&s_snapshot_lock);
     reset_state_locked();
@@ -1131,6 +1529,9 @@ esp_err_t sensor_telemetry_deinit(void)
     memset(&s_topics, 0, sizeof(s_topics));
 
     s_initialized = false;
+    #if ENABLE_WATER_LEVEL
+    wl_debounce_deinit();
+    #endif
     ESP_LOGI(TAG, "Sensor telemetry deinitialized");
     return ESP_OK;
 }
@@ -1154,82 +1555,194 @@ esp_err_t sensor_telemetry_sample(void)
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
     /* ── Water level (digital) ─────────────────────────────────────────── */
-    int water_level = gpio_get_level((gpio_num_t)PIN_SENSOR_WATER_LEVEL);
+    #if ENABLE_WATER_LEVEL
+    int water_level = wl_debounce_filter(gpio_get_level((gpio_num_t)PIN_SENSOR_WATER_LEVEL));
+    #else
+    int water_level = 0;
+    #endif
 
     /* ── Water temperature (DS18B20 1-Wire, trigger-then-read pattern) ── */
+    #if ENABLE_WATER_TEMP
     /* Read the result of the conversion triggered at the end of the         */
     /* previous cycle, then immediately trigger the next conversion so it    */
     /* is ready by the time this function is called again (~1000 ms later).  */
     float temp_c = 0.0f;
-    (void)sample_water_temp(&temp_c);
+    bool temp_valid = (sample_water_temp(&temp_c) == ESP_OK);
     ow_trigger_conversion();
+
+    /* Track consecutive failures to expose sensor health in the snapshot */
+    s_temp_read_fresh = temp_valid;
+    if (temp_valid) {
+        s_temp_fail_count     = 0;
+        s_ow_dead_retry_count = 0;
+    } else {
+        if (s_temp_fail_count < SENSOR_TEMP_FAIL_THRESHOLD) {
+            s_temp_fail_count++;
+        } else {
+            /* Sensor has been continuously dead for SENSOR_TEMP_FAIL_THRESHOLD
+             * samples. Attempt a full bus reinit every OW_DEAD_RETRY_INTERVAL
+             * samples to self-recover from permanent hardware glitches without
+             * requiring a device restart. */
+            s_ow_dead_retry_count++;
+            if (s_ow_dead_retry_count >= OW_DEAD_RETRY_INTERVAL) {
+                ESP_LOGW(TAG, "DS18B20 dead for %d samples — attempting recovery reinit",
+                         SENSOR_TEMP_FAIL_THRESHOLD + s_ow_dead_retry_count);
+                ow_reinit();
+            }
+        }
+    }
+    #else
+    float temp_c = 0.0f;
+    bool temp_valid = false;
+    #endif
+
+    /* Track raw read success independently of calibration validity.
+     * These flags gate snap.valid so /raw topics publish even when
+     * calibration doesn't exist yet — essential for calibration workflow. */
+    bool temp_raw_ok = temp_valid;
+    bool ph_raw_ok = false;
+    bool tds_raw_ok = false;
 
     /* ── pH ────────────────────────────────────────────────────────────── */
     sensor_reading_t ph_reading = {0};
 
     /* Take a local copy of calibration to avoid holding the lock during I/O */
     portENTER_CRITICAL(&s_cali_lock);
+    #if (PH_SOURCE_USE_SERIAL == 1) || (PH_SOURCE_USE_SERIAL == 2)
     calibration_t ph_cali  = s_ph_cali;
+    #endif
     calibration_t tds_cali = s_tds_cali;
     portEXIT_CRITICAL(&s_cali_lock);
 
-    {
-        int ph_raw = 0;
-        esp_err_t adc_ret = ads1115_read_channel(ADS1115_MUX_AIN0_GND, &ph_raw);
-        if (adc_ret != ESP_OK) {
-            ESP_LOGW(TAG, "pH ADS1115 read failed: %s", esp_err_to_name(adc_ret));
-            ph_raw = 0;
+    #if (PH_SOURCE_USE_SERIAL == 1)
+        {
+            float serial_ph = 0.0f;
+            int   serial_raw = 0;
+            esp_err_t serial_ret = ph_serial_read(&serial_raw, &serial_ph);
+            if (serial_ret == ESP_OK) {
+                ph_reading.raw = (uint16_t)serial_raw;
+                ph_raw_ok = true;
+                /* Gate on calibration: serial module outputs a pre-scaled pH
+                 * value but we still require a valid calibration entry before
+                 * marking the reading valid so safety checks are not triggered
+                 * on an uncalibrated sensor.  Apply the linear model so the
+                 * server-side calibration can trim offset/slope as needed. */
+                if (ph_cali.valid) {
+                    float calibrated = ph_cali.slope * serial_ph + ph_cali.offset;
+                    if (isfinite(calibrated) &&
+                        calibrated >= PH_VALUE_MIN &&
+                        calibrated <= PH_VALUE_MAX) {
+                        ph_reading.value = calibrated;
+                        ph_reading.valid = true;
+                    }
+                }
+            } else {
+                ESP_LOGW(TAG, "pH serial read failed: %s", esp_err_to_name(serial_ret));
+            }
         }
-        apply_adc_calibration_and_validate(&ph_cali, ph_raw,
-                                           PH_VALUE_MIN, PH_VALUE_MAX,
-                                           &ph_reading);
-    }
+    #elif (PH_SOURCE_USE_SERIAL == 2)
+        {
+            /* ADS1115 path — AIN1 for pH only; TDS on AIN0 below is untouched */
+            int ph_raw = 0;
+            esp_err_t adc_ret = ads1115_read_ph_median(&ph_raw);
+            if (adc_ret != ESP_OK) {
+                ESP_LOGW(TAG, "pH ADS1115 read failed: %s", esp_err_to_name(adc_ret));
+                ph_raw = 0;
+            } else {
+                ph_raw_ok = true;
+            }
+            apply_adc_calibration_and_validate(&ph_cali, ph_raw,
+                                               PH_VALUE_MIN, PH_VALUE_MAX,
+                                               &ph_reading);
+        }
+    #endif
 
     /* ── TDS ───────────────────────────────────────────────────────────── */
     sensor_reading_t tds_reading = {0};
 
+    #if ENABLE_TDS_SENSOR
     {
         int tds_raw = 0;
+        /* Median filter temporarily disabled for trial — single sample. */
         esp_err_t adc_ret = ads1115_read_channel(ADS1115_MUX_AIN1_GND, &tds_raw);
         if (adc_ret != ESP_OK) {
             ESP_LOGW(TAG, "TDS ADS1115 read failed: %s", esp_err_to_name(adc_ret));
-            tds_raw = 0;
+            /* Do NOT fall through to calibration — tds_reading stays zeroed.
+             * tds_raw_ok remains false so neither the history nor the snapshot
+             * valid flag are updated from this failed cycle. */
+        } else {
+            tds_raw_ok = true;
+
+            /* Store raw ADC count only on a successful read so that a failed
+             * read never publishes raw=0 as if it were a real measurement. */
+            tds_reading.raw = (uint16_t)tds_raw;
+
+            /* Temperature compensation: normalise raw signal to 25 °C equivalent.
+             * comp_raw = raw / (1.0 + 0.02 * (T - 25))
+             * Falls back to 25 °C (coeff = 1.0, no-op) when temp is unavailable. */
+            float tds_temp_c     = temp_valid ? temp_c : 25.0f;
+            float tds_comp_coeff = 1.0f + 0.02f * (tds_temp_c - 25.0f);
+            if (tds_comp_coeff < 0.01f) tds_comp_coeff = 0.01f; /* guard div-by-zero */
+            float tds_comp_raw   = (float)tds_raw / tds_comp_coeff;
+
+            if (tds_cali.valid) {
+                float tds_computed = tds_cali.slope * tds_comp_raw + tds_cali.offset;
+                if (isfinite(tds_computed) &&
+                    tds_computed >= TDS_VALUE_MIN &&
+                    tds_computed <= TDS_VALUE_MAX) {
+                    tds_reading.value = tds_computed;
+                    tds_reading.valid = true;
+                }
+            }
         }
-        apply_adc_calibration_and_validate(&tds_cali, tds_raw,
-                                           TDS_VALUE_MIN, TDS_VALUE_MAX,
-                                           &tds_reading);
     }
+    #endif
 
     /* ── Update rolling history & snapshot ────────────────────────────── */
     portENTER_CRITICAL(&s_snapshot_lock);
 
-    s_temp_history[s_history_index] = temp_c;
-    /* Only record calibrated values; skip invalid readings so history
-     * averages are never polluted with uncalibrated zeros. */
+    /* Only record valid readings so history averages are never polluted
+     * with zeros from failed reads or absent calibration.
+     * Each sensor has its own count so average_window() divides only by
+     * the number of slots actually written — prevents startup zero-pollution
+     * from dragging the average below range thresholds. */
+    if (temp_valid) {
+        s_temp_history[s_history_index] = temp_c;
+        if (s_temp_history_count < SENSOR_SAMPLE_WINDOW) s_temp_history_count++;
+    }
     if (ph_reading.valid) {
-        s_ph_history[s_history_index]  = ph_reading.value;
+        s_ph_history[s_history_index] = ph_reading.value;
+        if (s_ph_history_count < SENSOR_SAMPLE_WINDOW) s_ph_history_count++;
     }
     if (tds_reading.valid) {
         s_tds_history[s_history_index] = tds_reading.value;
+        if (s_tds_history_count < SENSOR_SAMPLE_WINDOW) s_tds_history_count++;
     }
 
-    if (s_history_count < SENSOR_SAMPLE_WINDOW) {
-        s_history_count++;
-    }
     s_history_index = (s_history_index + 1U) % SENSOR_SAMPLE_WINDOW;
 
-    s_snapshot.valid       = true;
-    s_snapshot.water_level = water_level ? 1 : 0;
-    s_snapshot.water_temp  = average_window(s_temp_history, s_history_count);
+    /* Snapshot is valid as soon as ANY raw read succeeds, regardless of
+     * calibration state. This enables /raw publishing before calibration
+     * exists — essential for server-side calibration workflow. */
+    s_snapshot.valid = temp_raw_ok || ph_raw_ok || tds_raw_ok;
+    s_snapshot.water_level          = water_level ? 1 : 0;
+    s_snapshot.water_temp           = average_window(s_temp_history, s_temp_history_count);
+#if ENABLE_WATER_TEMP
+    s_snapshot.water_temp_sensor_ok = s_temp_read_fresh;  /* only true when last read was valid */
+    s_snapshot.water_temp_sensor_dead = (s_temp_fail_count >= SENSOR_TEMP_FAIL_THRESHOLD);
+#else
+    s_snapshot.water_temp_sensor_ok = false;   /* sensor disabled — suppress safety checks */
+    s_snapshot.water_temp_sensor_dead = false;
+#endif
 
-    /* Raw counts for pH/TDS are the GPIO level (0 or 1). Water-temp is read
-     * via DS18B20 1-Wire and has no raw count in the snapshot. */
-    s_snapshot.ph_raw   = ph_reading.raw;   /* GPIO level 0 or 1 */
-    s_snapshot.ph       = average_window(s_ph_history, s_history_count);
+    /* Raw counts for pH/TDS are ADS1115 16-bit counts (0–32767).
+     * Water-temp is read via DS18B20 1-Wire and has no raw count. */
+    s_snapshot.ph_raw   = ph_reading.raw;
+    s_snapshot.ph       = average_window(s_ph_history, s_ph_history_count);
     s_snapshot.ph_valid = ph_reading.valid;
 
-    s_snapshot.tds_raw   = tds_reading.raw;  /* GPIO level 0 or 1 */
-    s_snapshot.tds       = average_window(s_tds_history, s_history_count);
+    s_snapshot.tds_raw   = tds_reading.raw;
+    s_snapshot.tds       = average_window(s_tds_history, s_tds_history_count);
     s_snapshot.tds_valid = tds_reading.valid;
 
     s_snapshot.publish_count++;

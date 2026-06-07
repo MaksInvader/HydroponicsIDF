@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
-        "setup_button.c"
+    "i2c_bus.c"
         "wifi_manager.c"
         "web_portal.c"
         "ota_update.c"
@@ -15,6 +15,9 @@ idf_component_register(
         "sensor_calibration_nvs.c"
         "runtime_tasks.c"
         "runtime_safety.c"
+        "setup_button.c"
+       "ph_serial.c"
+        "syslog.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

@@ -44,6 +44,8 @@ jobs:
           # Increase socket/VFS limits to avoid accept() ENFILE
           CONFIG_LWIP_MAX_SOCKETS=16
           CONFIG_ESP_VFS_MAX_COUNT=16
+          CONFIG_PARTITION_TABLE_CUSTOM=y
+          CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
           EOF
 
           # 3. Build project

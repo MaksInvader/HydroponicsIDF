@@ -35,7 +35,7 @@
 #include "zone_config.h"
 
 #define DOSING_TASK_STACK 4096
-#define SENSOR_TASK_STACK 6144
+#define SENSOR_TASK_STACK 8192  /* Increased from 6144 - ADS1115 + DS18B20 + logging needs more headroom */
 #define COMM_TASK_STACK 8192
 
 #define DOSING_TASK_PRIORITY 3
@@ -43,12 +43,12 @@
 #define COMM_TASK_PRIORITY 1
 #define SAFETY_TASK_PRIORITY 4
 
-#define SENSOR_SAMPLE_INTERVAL_MS 1000
+#define SENSOR_SAMPLE_INTERVAL_MS 2000
 #define COMM_INTERVAL_MS 1000
 #define VERSION_PUBLISH_INTERVAL_MS 30000
 #define DOSING_QUEUE_RECV_TIMEOUT_MS 200
 
-#define DOSING_QUEUE_LEN 16
+#define DOSING_QUEUE_LEN 64
 
 #define ZONE_COMMAND_BUFFER_SIZE 120
 #define ZONE_COMMAND_MAX_LEN (ZONE_COMMAND_BUFFER_SIZE - 1)
@@ -57,10 +57,6 @@
 #define OTA_HTTP_PORT_DEFAULT 8123
 #define OTA_HTTP_PATH_DEFAULT "/local/firmware/lorong_node.bin"
 #define OTA_VERSION_MAX_LEN 32
-
-/* Valve debounce: ON arriving within this window after an OFF is deferred.
- * The deferred ON is enqueued only if no new OFF arrives before the timer fires. */
-#define VALVE_DEBOUNCE_MS 3000
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define SAFE_STRCPY(dst, src) do { \
@@ -92,6 +88,10 @@ static SemaphoreHandle_t s_runtime_mutex = NULL;
 static SemaphoreHandle_t s_snapshot_mutex = NULL;
 static portMUX_TYPE s_runtime_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_task_handle_lock = portMUX_INITIALIZER_UNLOCKED;
+/* Guards s_running, s_starting, s_zone_id — readable from any task/core. */
+static portMUX_TYPE s_zone_id_lock = portMUX_INITIALIZER_UNLOCKED;
+/* Guards s_ota_latest_version — written from calling task, read from MQTT task. */
+static portMUX_TYPE s_ota_version_lock = portMUX_INITIALIZER_UNLOCKED;
 static EventGroupHandle_t s_task_exit_event = NULL;
 static TaskHandle_t s_dosing_task = NULL;
 static TaskHandle_t s_sensor_task = NULL;
@@ -116,11 +116,6 @@ static char s_ota_trigger_topic[ZONE_TOPIC_BUFFER_SIZE];
 static char s_ota_latest_version[OTA_VERSION_MAX_LEN];
 static char s_zone_id[ZONE_ID_MAX_LEN + 1];
 
-/* Valve debounce state */
-static esp_timer_handle_t s_valve_debounce_timer   = NULL;
-static portMUX_TYPE       s_valve_debounce_lock    = portMUX_INITIALIZER_UNLOCKED;
-static TickType_t         s_valve_last_off_tick    = 0;
-static bool               s_valve_debounce_pending = false;
 static char s_zone_name[ZONE_NAME_MAX_LEN + 1];
 static actuator_last_command_t s_last_lcd_rendered_cmd;
 static sensor_telemetry_snapshot_t s_last_good_snapshot;
@@ -224,9 +219,10 @@ static void delete_running_tasks(void)
 {
     for (size_t i = 0; i < ARRAY_SIZE(s_task_slots); i++) {
         TaskHandle_t task_handle = take_task_handle(s_task_slots[i].handle);
-        if (task_handle != NULL) {
+        if (task_handle != NULL && eTaskGetState(task_handle) != eDeleted) {
             vTaskDelete(task_handle);
         }
+        task_handle = NULL;
     }
 }
 
@@ -300,12 +296,25 @@ static void runtime_tasks_on_mqtt_connection(bool connected, void *user_ctx)
         return;
     }
 
-    if (!s_running || s_starting || s_zone_id[0] == '\0') {
+    /* Snapshot s_running, s_starting, and s_zone_id under s_zone_id_lock.
+     * These are written under s_runtime_mutex on the calling task/core;
+     * reading them without a fence here is a multi-core data race. */
+    char zone_id_snap[ZONE_ID_MAX_LEN + 1];
+    bool is_running, is_starting;
+    portENTER_CRITICAL(&s_zone_id_lock);
+    is_running  = s_running;
+    is_starting = s_starting;
+    memcpy(zone_id_snap, s_zone_id, sizeof(zone_id_snap));
+    portEXIT_CRITICAL(&s_zone_id_lock);
+
+    if (!is_running || is_starting || zone_id_snap[0] == '\0') {
         return;
     }
 
-    publish_current_version(s_zone_id);
+    publish_current_version(zone_id_snap);
+#if ENABLE_ACTUATORS
     publish_actuator_states();
+#endif
 }
 
 typedef struct {
@@ -419,105 +428,27 @@ static bool enqueue_command(const dosing_command_t *cmd, const char *source)
     }
 
     if (sent != pdTRUE) {
-        ESP_LOGW(TAG, "%s: dosing queue full, dropping command", source != NULL ? source : "enqueue");
-        return false;
+        if (xPortInIsrContext()) {
+            /* Cannot safely reset queue from ISR context — drop the command. */
+            ESP_LOGW(TAG, "%s: dosing queue full (ISR), dropping command",
+                     source != NULL ? source : "enqueue");
+            return false;
+        }
+        /* Queue full — flush all stale pending commands and immediately enqueue
+         * the latest one so the most recent server order takes priority. */
+        UBaseType_t flushed = uxQueueMessagesWaiting(s_dosing_queue);
+        xQueueReset(s_dosing_queue);
+        ESP_LOGW(TAG, "%s: dosing queue full — cleared %u stale command(s), executing latest",
+                 source != NULL ? source : "enqueue", (unsigned)flushed);
+        sent = xQueueSend(s_dosing_queue, cmd, 0);
+        if (sent != pdTRUE) {
+            ESP_LOGE(TAG, "%s: failed to enqueue after queue reset",
+                     source != NULL ? source : "enqueue");
+            return false;
+        }
     }
 
     return true;
-}
-
-static void valve_debounce_timer_cb(void *arg)
-{
-    (void)arg;
-
-    portENTER_CRITICAL(&s_valve_debounce_lock);
-    bool should_enqueue = s_valve_debounce_pending;
-    s_valve_debounce_pending = false;
-    portEXIT_CRITICAL(&s_valve_debounce_lock);
-
-    if (!should_enqueue) {
-        return;
-    }
-
-    dosing_command_t cmd = {
-        .channel  = ACTUATOR_CHANNEL_VALVE,
-        .action   = ACTUATOR_ACTION_ON,
-        .pulse_ms = 0,
-    };
-    ESP_LOGI(TAG, "Valve debounce elapsed — enqueuing deferred ON");
-    (void)enqueue_command(&cmd, "valve debounce");
-}
-
-static void valve_debounce_init(void)
-{
-    if (s_valve_debounce_timer != NULL) {
-        return;
-    }
-    esp_timer_create_args_t args = {
-        .callback        = valve_debounce_timer_cb,
-        .arg             = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name            = "valve_debounce",
-    };
-    esp_timer_create(&args, &s_valve_debounce_timer);
-}
-
-static void valve_debounce_deinit(void)
-{
-    if (s_valve_debounce_timer == NULL) {
-        return;
-    }
-    esp_timer_stop(s_valve_debounce_timer);
-    esp_timer_delete(s_valve_debounce_timer);
-    s_valve_debounce_timer = NULL;
-    portENTER_CRITICAL(&s_valve_debounce_lock);
-    s_valve_debounce_pending = false;
-    s_valve_last_off_tick    = 0;
-    portEXIT_CRITICAL(&s_valve_debounce_lock);
-}
-
-/* Returns true if the ON was swallowed (deferred). Returns false to proceed normally. */
-static bool valve_debounce_filter(actuator_action_t action)
-{
-    if (action == ACTUATOR_ACTION_OFF) {
-        /* Record OFF timestamp, cancel any pending deferred ON */
-        portENTER_CRITICAL(&s_valve_debounce_lock);
-        s_valve_last_off_tick    = xTaskGetTickCount();
-        s_valve_debounce_pending = false;
-        portEXIT_CRITICAL(&s_valve_debounce_lock);
-        if (s_valve_debounce_timer != NULL) {
-            esp_timer_stop(s_valve_debounce_timer);
-        }
-        return false; /* enqueue the OFF normally */
-    }
-
-    if (action == ACTUATOR_ACTION_ON) {
-        portENTER_CRITICAL(&s_valve_debounce_lock);
-        TickType_t last_off = s_valve_last_off_tick;
-        portEXIT_CRITICAL(&s_valve_debounce_lock);
-
-        if (last_off == 0) {
-            return false; /* no prior OFF — first ON, pass through immediately */
-        }
-
-        TickType_t elapsed_ms = (TickType_t)((xTaskGetTickCount() - last_off) * portTICK_PERIOD_MS);
-
-        if (elapsed_ms < (TickType_t)VALVE_DEBOUNCE_MS) {
-            uint64_t remaining_us = ((uint64_t)(VALVE_DEBOUNCE_MS - elapsed_ms)) * 1000ULL;
-            portENTER_CRITICAL(&s_valve_debounce_lock);
-            s_valve_debounce_pending = true;
-            portEXIT_CRITICAL(&s_valve_debounce_lock);
-            if (s_valve_debounce_timer != NULL) {
-                esp_timer_stop(s_valve_debounce_timer);
-                esp_timer_start_once(s_valve_debounce_timer, remaining_us);
-            }
-            ESP_LOGI(TAG, "Valve ON deferred — %lu ms remaining in debounce window",
-                     (unsigned long)(VALVE_DEBOUNCE_MS - elapsed_ms));
-            return true; /* swallow */
-        }
-    }
-
-    return false;
 }
 
 static void on_channel_command(const char *topic, const char *payload, int payload_len, void *user_ctx)
@@ -529,10 +460,6 @@ static void on_channel_command(const char *topic, const char *payload, int paylo
     uint32_t pulse_ms = 0;
     if (actuator_control_parse_action_payload(payload, payload_len, &action, &pulse_ms) != ESP_OK) {
         ESP_LOGW(TAG, "Invalid actuator command payload");
-        return;
-    }
-
-    if (channel == ACTUATOR_CHANNEL_VALVE && valve_debounce_filter(action)) {
         return;
     }
 
@@ -552,10 +479,6 @@ static void on_zone_command(const char *topic, const char *payload, int payload_
     dosing_command_t cmd;
     if (!parse_zone_command(payload, payload_len, &cmd)) {
         ESP_LOGW(TAG, "Invalid zone command format. Expected: '<Channel> ON|OFF|PULSE <ms>'");
-        return;
-    }
-
-    if (cmd.channel == ACTUATOR_CHANNEL_VALVE && valve_debounce_filter(cmd.action)) {
         return;
     }
 
@@ -608,6 +531,7 @@ static void on_safety_clear_command(const char *topic, const char *payload, int 
 
     if (strcmp(buf, "CLEAR") == 0 || strcmp(buf, "ALL") == 0) {
         ESP_LOGW(TAG, "Safety CLEAR received — restarting device");
+        indicator_led_startup_beep();
         esp_restart();
         return;
     }
@@ -647,10 +571,15 @@ static void on_ota_latest_version(const char *topic, const char *payload, int pa
         return;
     }
 
-    if (strcmp(s_ota_latest_version, version) != 0) {
+    portENTER_CRITICAL(&s_ota_version_lock);
+    bool version_changed = (strcmp(s_ota_latest_version, version) != 0);
+    if (version_changed) {
         strncpy(s_ota_latest_version, version, sizeof(s_ota_latest_version) - 1);
         s_ota_latest_version[sizeof(s_ota_latest_version) - 1] = '\0';
-        ESP_LOGI(TAG, "OTA latest version updated: %s", s_ota_latest_version);
+    }
+    portEXIT_CRITICAL(&s_ota_version_lock);
+    if (version_changed) {
+        ESP_LOGI(TAG, "OTA latest version updated: %s", version);
     }
 }
 
@@ -694,8 +623,13 @@ static void on_ota_trigger(const char *topic, const char *payload, int payload_l
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
     const char *current = (app_desc != NULL && app_desc->version[0] != '\0') ? app_desc->version : "unknown";
-    if (s_ota_latest_version[0] != '\0') {
-        ESP_LOGI(TAG, "OTA trigger received: current=%s latest=%s", current, s_ota_latest_version);
+    char ota_ver_snap[OTA_VERSION_MAX_LEN];
+    portENTER_CRITICAL(&s_ota_version_lock);
+    memcpy(ota_ver_snap, s_ota_latest_version, sizeof(ota_ver_snap));
+    portEXIT_CRITICAL(&s_ota_version_lock);
+
+    if (ota_ver_snap[0] != '\0') {
+        ESP_LOGI(TAG, "OTA trigger received: current=%s latest=%s", current, ota_ver_snap);
     } else {
         ESP_LOGI(TAG, "OTA trigger received: current=%s latest version not published", current);
     }
@@ -728,12 +662,42 @@ static void on_ota_trigger(const char *topic, const char *payload, int payload_l
     }
 }
 
+/* Returns true if the channel is a peristaltic dosing pump. */
+static bool is_peristaltic_channel(actuator_channel_t ch)
+{
+    return ch == ACTUATOR_CHANNEL_PER_NUTA   ||
+           ch == ACTUATOR_CHANNEL_PER_NUTB   ||
+           ch == ACTUATOR_CHANNEL_PER_PH_UP  ||
+           ch == ACTUATOR_CHANNEL_PER_PH_DOWN;
+}
+
+/* Returns true if any peristaltic pump OTHER than except_channel is currently ON.
+ * Used to enforce mutual exclusion — only one peristaltic may run at a time. */
+static bool any_peristaltic_pump_running(actuator_channel_t except_channel)
+{
+    const actuator_channel_t per_channels[] = {
+        ACTUATOR_CHANNEL_PER_NUTA,
+        ACTUATOR_CHANNEL_PER_NUTB,
+        ACTUATOR_CHANNEL_PER_PH_UP,
+        ACTUATOR_CHANNEL_PER_PH_DOWN,
+    };
+    for (size_t i = 0; i < sizeof(per_channels) / sizeof(per_channels[0]); i++) {
+        if (per_channels[i] == except_channel) continue;
+        if (runtime_safety_get_channel_state(per_channels[i])) return true;
+    }
+    return false;
+}
+
 static void dosing_task(void *arg)
 {
     (void)arg;
     dosing_command_t cmd;
 
     runtime_safety_wdt_register();
+
+    /* Log initial stack watermark */
+    UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Dosing task stack watermark: %u bytes free", (unsigned)(stack_hwm * sizeof(StackType_t)));
 
     while (!atomic_load(&s_stop_requested)) {
         if (xQueueReceive(s_dosing_queue, &cmd, pdMS_TO_TICKS(DOSING_QUEUE_RECV_TIMEOUT_MS)) == pdTRUE) {
@@ -742,15 +706,34 @@ static void dosing_task(void *arg)
                 continue;
             }
 
+            /* ── Peristaltic pump mutual exclusion ──────────────────────────────
+             * Only one peristaltic pump (NutA, NutB, pH Up, pH Down) may run
+             * at a time. pH Up + pH Down together is a chemical safety fault;
+             * any other simultaneous conflict is a non-fatal skip (warning only). */
             if ((cmd.action == ACTUATOR_ACTION_ON || cmd.action == ACTUATOR_ACTION_PULSE) &&
-                ((cmd.channel == ACTUATOR_CHANNEL_PER_PH_UP && runtime_safety_get_channel_state(ACTUATOR_CHANNEL_PER_PH_DOWN)) ||
-                 (cmd.channel == ACTUATOR_CHANNEL_PER_PH_DOWN && runtime_safety_get_channel_state(ACTUATOR_CHANNEL_PER_PH_UP)))) {
+                is_peristaltic_channel(cmd.channel) &&
+                any_peristaltic_pump_running(cmd.channel)) {
 #if DEV_MODE
-                ESP_LOGW(TAG, "[DEV_MODE] pH interlock violation suppressed");
+                ESP_LOGW(TAG, "[DEV_MODE] Peristaltic interlock — skipping ch=%d (suppressed)",
+                         (int)cmd.channel);
 #else
-                runtime_safety_fault_set(SAFETY_FAULT_PH_INTERLOCK, "pH interlock violation");
-                continue;
+                bool ph_chemical_conflict =
+                    (cmd.channel == ACTUATOR_CHANNEL_PER_PH_UP   &&
+                     runtime_safety_get_channel_state(ACTUATOR_CHANNEL_PER_PH_DOWN)) ||
+                    (cmd.channel == ACTUATOR_CHANNEL_PER_PH_DOWN &&
+                     runtime_safety_get_channel_state(ACTUATOR_CHANNEL_PER_PH_UP));
+
+                if (ph_chemical_conflict) {
+                    /* pH Up and pH Down simultaneously is a chemical hazard — fault */
+                    runtime_safety_fault_set(SAFETY_FAULT_PH_INTERLOCK,
+                                            "pH Up+Down simultaneous — chemical hazard");
+                } else {
+                    /* Another peristaltic is already running — skip, non-fatal */
+                    ESP_LOGW(TAG, "Peristaltic interlock: ch=%d skipped, another pump is running",
+                             (int)cmd.channel);
+                }
 #endif
+                continue;
             }
 
             esp_err_t ret = ESP_OK;
@@ -780,19 +763,6 @@ static void dosing_task(void *arg)
             if (ret != ESP_OK) {
                 ESP_LOGW(TAG, "Dosing command failed: %s", esp_err_to_name(ret));
                 continue;
-            }
-
-            /* Publish status feedback immediately after executing the command.
-             * For PULSE the actuator ends LOW, so publish OFF. */
-            {
-                const char *status_topic = actuator_control_get_status_topic(cmd.channel);
-                if (status_topic != NULL && status_topic[0] != '\0') {
-                    bool final_state = (cmd.action == ACTUATOR_ACTION_ON);
-                    if (cmd.action == ACTUATOR_ACTION_PULSE) {
-                        final_state = false;
-                    }
-                    mqtt_manager_publish(status_topic, final_state ? "ON" : "OFF", 1, 0);
-                }
             }
 
             runtime_safety_dose_watchdog_update(cmd.channel, cmd.action, cmd.pulse_ms);
@@ -830,7 +800,18 @@ static void sensor_task(void *arg)
 
     runtime_safety_wdt_register();
 
+    /* Log initial stack watermark */
+    UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Sensor task stack watermark: %u bytes free", (unsigned)(stack_hwm * sizeof(StackType_t)));
+
+    uint32_t loop_count = 0;
     while (!atomic_load(&s_stop_requested)) {
+        /* Log stack usage periodically to detect gradual leaks */
+        if (++loop_count % 100 == 0) {
+            stack_hwm = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "Sensor task stack watermark: %u bytes free", (unsigned)(stack_hwm * sizeof(StackType_t)));
+        }
+
         esp_err_t ret = sensor_telemetry_sample();
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Sensor sample failed: %s", esp_err_to_name(ret));
@@ -900,6 +881,10 @@ static void comm_task(void *arg)
 
     runtime_safety_wdt_register();
 
+    /* Log initial stack watermark */
+    UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Comm task stack watermark: %u bytes free", (unsigned)(stack_hwm * sizeof(StackType_t)));
+
     while (!atomic_load(&s_stop_requested)) {
         TickType_t now = xTaskGetTickCount();
         sensor_telemetry_snapshot_t snap = {0};
@@ -938,6 +923,7 @@ static void comm_task(void *arg)
             comm_task_publish_sensors(&snap, s_zone_id);
         }
 
+#if ENABLE_ACTUATORS && ENABLE_LCD
         actuator_last_command_t latest_cmd;
         if (actuator_control_get_last_command(&latest_cmd) == ESP_OK) {
             if (strcmp(latest_cmd.topic, s_last_lcd_rendered_cmd.topic) != 0 ||
@@ -981,6 +967,7 @@ static void comm_task(void *arg)
                 s_last_lcd_rendered_cmd = latest_cmd;
             }
         }
+#endif /* ENABLE_ACTUATORS && ENABLE_LCD */
 
         runtime_safety_heartbeat_comm();
         runtime_safety_wdt_kick();
@@ -1054,16 +1041,25 @@ static void cleanup_runtime_locked(void)
                 TaskHandle_t h = *s_task_slots[i].handle;
                 if (h != NULL) {
                     esp_err_t wdt_ret = esp_task_wdt_delete(h);
-                    if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_INVALID_ARG) {
+                    if (wdt_ret == ESP_ERR_NOT_FOUND) {
+                        /* Task already unregistered itself - it's exiting.
+                         * Clear the handle so delete_running_tasks() skips it. */
+                        portENTER_CRITICAL(&s_task_handle_lock);
+                        *s_task_slots[i].handle = NULL;
+                        portEXIT_CRITICAL(&s_task_handle_lock);
+                        ESP_LOGW(TAG, "Task already exiting, cleared handle to prevent double-delete");
+                    } else if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_INVALID_ARG) {
                         ESP_LOGW(TAG, "WDT deregister for stale task failed: %s",
                                  esp_err_to_name(wdt_ret));
                     }
                 }
             }
+
+            /* Only forcibly delete tasks that timed out. Tasks that exited
+             * cleanly have already deleted themselves. */
+            delete_running_tasks();
         }
     }
-
-    delete_running_tasks();
 
     if (s_dosing_queue != NULL) {
         vQueueDelete(s_dosing_queue);
@@ -1078,8 +1074,9 @@ static void cleanup_runtime_locked(void)
     runtime_safety_bind(NULL);
 
     sensor_telemetry_deinit();
-    valve_debounce_deinit();
+#if ENABLE_ACTUATORS
     actuator_control_deinit();
+#endif
     clear_subscription_tracking();
     s_zone_id[0] = '\0';
     s_zone_name[0] = '\0';
@@ -1089,12 +1086,29 @@ static void cleanup_runtime_locked(void)
     s_ota_latest_topic[0] = '\0';
     s_ota_trigger_topic[0] = '\0';
     s_emergency_topic[0] = '\0';
+    /* Fix 4: guard s_ota_latest_version against MQTT-task concurrent read */
+    portENTER_CRITICAL(&s_ota_version_lock);
     s_ota_latest_version[0] = '\0';
+    portEXIT_CRITICAL(&s_ota_version_lock);
+
     memset(&s_last_lcd_rendered_cmd, 0, sizeof(s_last_lcd_rendered_cmd));
+
+    /* Fix 3: take s_snapshot_mutex before zeroing the snapshot cache so
+     * comm_task cannot be mid-write while cleanup clears the struct. */
+    if (s_snapshot_mutex != NULL) {
+        xSemaphoreTake(s_snapshot_mutex, portMAX_DELAY);
+    }
     memset(&s_last_good_snapshot, 0, sizeof(s_last_good_snapshot));
     s_last_good_snapshot_valid = false;
-    s_running = false;
+    if (s_snapshot_mutex != NULL) {
+        xSemaphoreGive(s_snapshot_mutex);
+    }
+
+    /* Fix 1: guard s_running/s_starting/s_zone_id against MQTT-callback read */
+    portENTER_CRITICAL(&s_zone_id_lock);
+    s_running  = false;
     s_starting = false;
+    portEXIT_CRITICAL(&s_zone_id_lock);
 }
 
 void runtime_tasks_record_boot_faults(void)
@@ -1140,12 +1154,18 @@ static void runtime_prepare_state(const char *zone_id)
 {
     atomic_store(&s_stop_requested, false);
     clear_subscription_tracking();
+
+    portENTER_CRITICAL(&s_ota_version_lock);
     s_ota_latest_version[0] = '\0';
+    portEXIT_CRITICAL(&s_ota_version_lock);
 
     runtime_safety_reset_state();
     runtime_safety_reset_heartbeats();
 
+    portENTER_CRITICAL(&s_zone_id_lock);
     SAFE_STRCPY(s_zone_id, zone_id);
+    portEXIT_CRITICAL(&s_zone_id_lock);
+
     memset(&s_last_lcd_rendered_cmd, 0, sizeof(s_last_lcd_rendered_cmd));
     memset(&s_last_good_snapshot, 0, sizeof(s_last_good_snapshot));
     s_last_good_snapshot_valid = false;
@@ -1185,18 +1205,25 @@ static esp_err_t subscribe_formatted_topic(char *dst, size_t dst_len,
 
 static esp_err_t runtime_setup_resources(const char *zone_id)
 {
-    esp_err_t ret = indicator_led_init();
+    esp_err_t ret = ESP_OK;
+
+#if ENABLE_INDICATOR_LEDS
+    ret = indicator_led_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "indicator_led_init failed: %s", esp_err_to_name(ret));
         /* non-fatal — continue without LEDs */
+    } else {
+        /* Ring buzzer twice to indicate successful startup */
+        indicator_led_startup_beep();
     }
+#endif
 
+#if ENABLE_ACTUATORS
     ret = actuator_control_init(zone_id);
     if (ret != ESP_OK) {
         return ret;
     }
-    valve_debounce_init();
-
+#endif
     ret = sensor_telemetry_init(zone_id);
     if (ret != ESP_OK) {
         return ret;
@@ -1365,12 +1392,17 @@ esp_err_t runtime_tasks_start(const char *zone_id)
         return ret;
     }
 
-    if (s_running || s_starting) {
+    portENTER_CRITICAL(&s_zone_id_lock);
+    bool already_running = s_running || s_starting;
+    if (!already_running) {
+        s_starting = true;
+    }
+    portEXIT_CRITICAL(&s_zone_id_lock);
+
+    if (already_running) {
         runtime_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-
-    s_starting = true;
     runtime_prepare_state(zone_id);
 
     ret = runtime_setup_resources(zone_id);
@@ -1400,10 +1432,14 @@ esp_err_t runtime_tasks_start(const char *zone_id)
         runtime_safety_set_gate(true);
     }
 
-    s_running = true;
+    portENTER_CRITICAL(&s_zone_id_lock);
+    s_running  = true;
     s_starting = false;
+    portEXIT_CRITICAL(&s_zone_id_lock);
     atomic_store(&s_stop_requested, false);
+#if ENABLE_LCD
     lcd_status_show_zone_overview(s_zone_id, s_zone_name, "None");
+#endif
     ESP_LOGI(TAG, "Runtime tasks started: DosingTask(%d), SensorTask(%d), CommTask(%d), SafetyTask(%d)",
              DOSING_TASK_PRIORITY, SENSOR_TASK_PRIORITY, COMM_TASK_PRIORITY, SAFETY_TASK_PRIORITY);
     runtime_unlock();

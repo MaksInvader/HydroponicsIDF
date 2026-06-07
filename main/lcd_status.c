@@ -11,6 +11,11 @@
 
 #include "lcd_status.h"
 #include "pin_config.h"
+#include "i2c_bus.h"
+
+/* --------------------------------------------------------------------------
+ * Constants
+ * -------------------------------------------------------------------------- */
 
 #define LCD_COLS 20
 #define LCD_ROWS 4
@@ -27,8 +32,15 @@ static uint8_t s_lcd_addr;
 static bool s_lcd_ready;
 static SemaphoreHandle_t s_lcd_lock;
 
+/* Forward declaration */
+static void lcd_stop_scroll(void);
+
 static esp_err_t lcd_i2c_write_byte(uint8_t data)
 {
+    esp_err_t lock_ret = i2c_bus_lock(pdMS_TO_TICKS(500));
+    if (lock_ret != ESP_OK) {
+        return lock_ret;
+    }
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (uint8_t)((s_lcd_addr << 1) | I2C_MASTER_WRITE), true);
@@ -36,6 +48,7 @@ static esp_err_t lcd_i2c_write_byte(uint8_t data)
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(PIN_LCD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
+    i2c_bus_unlock();
     return ret;
 }
 
@@ -140,6 +153,11 @@ static void lcd_show_lines(const char *line0, const char *line1, const char *lin
 
 esp_err_t lcd_status_init(void)
 {
+    #if !ENABLE_LCD
+        ESP_LOGI(TAG, "LCD disabled (ENABLE_LCD=0)");
+        return ESP_OK;
+    #endif
+
     if (s_lcd_ready) {
         return ESP_OK;
     }
@@ -149,6 +167,12 @@ esp_err_t lcd_status_init(void)
         if (s_lcd_lock == NULL) {
             return ESP_ERR_NO_MEM;
         }
+    }
+
+    /* Initialise the shared I2C bus mutex (idempotent — safe if ADS1115 inits first) */
+    esp_err_t bus_ret = i2c_bus_init();
+    if (bus_ret != ESP_OK) {
+        return bus_ret;
     }
 
     i2c_config_t conf = {
@@ -161,9 +185,13 @@ esp_err_t lcd_status_init(void)
         .clk_flags = 0,
     };
 
-    ESP_ERROR_CHECK(i2c_param_config(PIN_LCD_I2C_PORT, &conf));
+    esp_err_t ret = i2c_param_config(PIN_LCD_I2C_PORT, &conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C param config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
-    esp_err_t ret = i2c_driver_install(PIN_LCD_I2C_PORT, conf.mode, 0, 0, 0);
+    ret = i2c_driver_install(PIN_LCD_I2C_PORT, conf.mode, 0, 0, 0);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(ret));
         return ret;
@@ -186,12 +214,33 @@ esp_err_t lcd_status_init(void)
     lcd_write_nibble(0x30, false);
     lcd_write_nibble(0x20, false);
 
-    ESP_ERROR_CHECK(lcd_command(0x28));
-    ESP_ERROR_CHECK(lcd_command(0x08));
-    ESP_ERROR_CHECK(lcd_command(0x01));
+    /* Initialize LCD with error checking instead of ESP_ERROR_CHECK to avoid crashes */
+    ret = lcd_command(0x28);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LCD command 0x28 failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ret = lcd_command(0x08);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LCD command 0x08 failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ret = lcd_command(0x01);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LCD command 0x01 failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
     vTaskDelay(pdMS_TO_TICKS(2));
-    ESP_ERROR_CHECK(lcd_command(0x06));
-    ESP_ERROR_CHECK(lcd_command(0x0C));
+    ret = lcd_command(0x06);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LCD command 0x06 failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ret = lcd_command(0x0C);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LCD command 0x0C failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     s_lcd_ready = true;
     ESP_LOGI(TAG, "LCD initialized at I2C address 0x%02X", s_lcd_addr);
@@ -203,58 +252,179 @@ void lcd_status_show_wifi_and_broker(const char *ssid, const char *broker_ip)
     if (!s_lcd_ready || ssid == NULL || broker_ip == NULL) {
         return;
     }
-
+    lcd_stop_scroll();
     char line1[LCD_COLS + 1];
     char line2[LCD_COLS + 1];
-
-    snprintf(line1, sizeof(line1), "SSID: %s", ssid);
-    snprintf(line2, sizeof(line2), "Broker: %s", broker_ip);
-    lcd_show_lines("WiFi + MQTT Setup", line1, line2, "Waiting MQTT...");
+    snprintf(line1, sizeof(line1), "%-*.*s", LCD_COLS, LCD_COLS, ssid);
+    snprintf(line2, sizeof(line2), "%-*.*s", LCD_COLS, LCD_COLS, broker_ip);
+    lcd_show_lines("** CONNECTING **    ", line1, line2, "  Please wait...    ");
 }
 
 void lcd_status_show_mqtt_connected(void)
 {
-    if (!s_lcd_ready) {
-        return;
-    }
-
-    lcd_show_lines("", "", "", "MQTT Connected");
+    if (!s_lcd_ready) return;
+    lcd_stop_scroll();
+    lcd_show_lines("====================",
+                   "   MQTT CONNECTED   ",
+                   "   System Online    ",
+                   "====================");
 }
 
 void lcd_status_show_zone_overview(const char *zone_id, const char *zone_name, const char *last_actuator)
 {
-    if (!s_lcd_ready || zone_id == NULL || zone_name == NULL) {
-        return;
-    }
-
-    char line0[LCD_COLS + 1];
+    if (!s_lcd_ready || zone_id == NULL || zone_name == NULL) return;
+    lcd_stop_scroll();
     char line1[LCD_COLS + 1];
     char line2[LCD_COLS + 1];
     char line3[LCD_COLS + 1];
-
-    snprintf(line0, sizeof(line0), "zone_id: %s", zone_id);
-    snprintf(line1, sizeof(line1), "name: %s", zone_name);
-    snprintf(line2, sizeof(line2), "Last Activate:");
-    snprintf(line3, sizeof(line3), "%s", (last_actuator != NULL && last_actuator[0] != '\0') ? last_actuator : "None");
-
-    lcd_show_lines(line0, line1, line2, line3);
+    snprintf(line1, sizeof(line1), "ID: %-*.*s", LCD_COLS - 4, LCD_COLS - 4, zone_id);
+    snprintf(line2, sizeof(line2), "%-*.*s", LCD_COLS, LCD_COLS, zone_name);
+    snprintf(line3, sizeof(line3), ">%-*.*s", LCD_COLS - 1, LCD_COLS - 1,
+             (last_actuator != NULL && last_actuator[0] != '\0') ? last_actuator : "None");
+    lcd_show_lines("---- ZONE ACTIVE ---", line1, line2, line3);
 }
 
 void lcd_status_show_actuator_event(const char *zone_id, const char *zone_name, const char *actuator_name, const char *sensor_text, const char *state_text)
 {
-    if (!s_lcd_ready || zone_id == NULL || zone_name == NULL || actuator_name == NULL) {
-        return;
-    }
-
-    char line0[LCD_COLS + 1];
+    if (!s_lcd_ready || zone_id == NULL || zone_name == NULL || actuator_name == NULL) return;
+    lcd_stop_scroll();
     char line1[LCD_COLS + 1];
     char line2[LCD_COLS + 1];
     char line3[LCD_COLS + 1];
+    snprintf(line1, sizeof(line1), "%-*.*s", LCD_COLS, LCD_COLS, zone_name);
+    snprintf(line2, sizeof(line2), "%-*.*s", LCD_COLS, LCD_COLS,
+             (sensor_text != NULL) ? sensor_text : "");
+    snprintf(line3, sizeof(line3), "[%-.*s] %s", LCD_COLS - 4, actuator_name,
+             (state_text != NULL) ? state_text : "?");
+    lcd_show_lines("*** ACTUATOR EVENT *", line1, line2, line3);
+}
 
-    snprintf(line0, sizeof(line0), "zone_id: %s", zone_id);
-    snprintf(line1, sizeof(line1), "name: %s", zone_name);
-    snprintf(line2, sizeof(line2), "%s", (sensor_text != NULL) ? sensor_text : "Sensor: N/A");
-    snprintf(line3, sizeof(line3), "%s: %s", actuator_name, (state_text != NULL) ? state_text : "N/A");
+/* --------------------------------------------------------------------------
+ * Scroll task — used by lcd_status_show_fault()
+ * -------------------------------------------------------------------------- */
 
-    lcd_show_lines(line0, line1, line2, line3);
+#define SCROLL_REASON_MAX   256
+#define SCROLL_STEP_MS      300
+#define SCROLL_GAP          4
+#define SCROLL_TASK_STACK   2048
+#define SCROLL_TASK_PRIO    1
+
+static TaskHandle_t s_scroll_task   = NULL;
+static char         s_scroll_reason[SCROLL_REASON_MAX];
+static char         s_scroll_code[32];
+
+static void scroll_fill_line(char *out, size_t out_len,
+                              const char *padded, size_t padded_len,
+                              size_t offset)
+{
+    for (size_t i = 0; i < out_len - 1; i++) {
+        out[i] = padded[(offset + i) % padded_len];
+    }
+    out[out_len - 1] = '\0';
+}
+
+static void lcd_scroll_task_fn(void *arg)
+{
+    (void)arg;
+
+    char padded[SCROLL_REASON_MAX + SCROLL_GAP + 1];
+    size_t reason_len = strlen(s_scroll_reason);
+    memcpy(padded, s_scroll_reason, reason_len);
+    for (int i = 0; i < SCROLL_GAP; i++) padded[reason_len + i] = ' ';
+    size_t padded_len = reason_len + SCROLL_GAP;
+    padded[padded_len] = '\0';
+
+    bool needs_scroll = (reason_len > (size_t)LCD_COLS);
+    size_t offset = 0;
+
+    while (true) {
+        if (xSemaphoreTake(s_lcd_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
+            char code_line[LCD_COLS + 1];
+            snprintf(code_line, sizeof(code_line), "%-.*s", LCD_COLS, s_scroll_code);
+
+            if (needs_scroll) {
+                char line2[LCD_COLS + 1];
+                char line3[LCD_COLS + 1];
+                scroll_fill_line(line2, sizeof(line2), padded, padded_len, offset);
+                scroll_fill_line(line3, sizeof(line3), padded, padded_len,
+                                 (offset + LCD_COLS) % padded_len);
+                lcd_write_line(0, "!!!!!  FAULT  !!!!!");
+                lcd_write_line(1, code_line);
+                lcd_write_line(2, line2);
+                lcd_write_line(3, line3);
+            } else {
+                char line2[LCD_COLS + 1];
+                snprintf(line2, sizeof(line2), "%-.*s", LCD_COLS, s_scroll_reason);
+                lcd_write_line(0, "!!!!!  FAULT  !!!!!");
+                lcd_write_line(1, code_line);
+                lcd_write_line(2, line2);
+                lcd_write_line(3, "");
+            }
+            xSemaphoreGive(s_lcd_lock);
+        }
+
+        if (needs_scroll) {
+            offset = (offset + 1) % padded_len;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SCROLL_STEP_MS));
+    }
+}
+
+static void lcd_stop_scroll(void)
+{
+    if (s_scroll_task != NULL) {
+        vTaskDelete(s_scroll_task);
+        s_scroll_task = NULL;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * New public display functions
+ * -------------------------------------------------------------------------- */
+
+void lcd_status_show_booting(void)
+{
+    if (!s_lcd_ready) return;
+    lcd_stop_scroll();
+    lcd_show_lines("====================",
+                   "    SYSTEM BOOT     ",
+                   "   Please wait...   ",
+                   "====================");
+}
+
+void lcd_status_show_setup(const char *ip)
+{
+    if (!s_lcd_ready) return;
+    lcd_stop_scroll();
+    char line2[LCD_COLS + 1];
+    snprintf(line2, sizeof(line2), "%-*.*s", LCD_COLS, LCD_COLS, (ip != NULL) ? ip : "");
+    lcd_show_lines("-- SETUP MODE ------",
+                   "Connect WiFi then:  ",
+                   line2,
+                   "to configure        ");
+}
+
+void lcd_status_show_fault(const char *fault_code, const char *reason)
+{
+    if (!s_lcd_ready) return;
+    lcd_stop_scroll();
+
+    /* Copy code and reason into scroll buffers before creating the task */
+    snprintf(s_scroll_code,   sizeof(s_scroll_code),   "%s",
+             (fault_code != NULL) ? fault_code : "FAULT");
+    snprintf(s_scroll_reason, sizeof(s_scroll_reason), "%s",
+             (reason != NULL && reason[0] != '\0') ? reason : "Unknown reason");
+
+    xTaskCreate(lcd_scroll_task_fn, "lcd_scroll", SCROLL_TASK_STACK,
+                NULL, SCROLL_TASK_PRIO, &s_scroll_task);
+}
+
+void lcd_status_show_emergency(void)
+{
+    if (!s_lcd_ready) return;
+    lcd_stop_scroll();
+    lcd_show_lines("!! EMERGENCY STOP !!",
+                   "!!!!!!!!!!!!!!!!!!!!",
+                   "!! EMERGENCY STOP !!",
+                   "!!!!!!!!!!!!!!!!!!!!");
 }

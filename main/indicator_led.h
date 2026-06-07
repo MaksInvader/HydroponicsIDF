@@ -37,6 +37,13 @@ void indicator_led_fault_blink(uint32_t duration_ms);
  */
 void indicator_led_set_fault(bool on);
 
+/**
+ * @brief Ring the buzzer (reserve binary) twice as a startup indication.
+ *        Blocking call — takes approximately 1 second to complete.
+ *        Call after system initialization to indicate successful boot/restart.
+ */
+void indicator_led_startup_beep(void);
+
 #ifdef __cplusplus
 }
 #endif

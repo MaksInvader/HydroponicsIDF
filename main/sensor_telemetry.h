@@ -13,6 +13,8 @@ typedef struct {
     bool valid;
     int  water_level;
     float water_temp;
+    bool  water_temp_sensor_ok;   /* true only when last read succeeded (gates OOR fault check) */
+    bool  water_temp_sensor_dead; /* true after SENSOR_TEMP_FAIL_THRESHOLD consecutive failures */
 
     /* pH */
     uint16_t ph_raw;        /* averaged raw ADC counts                        */
