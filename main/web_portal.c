@@ -636,7 +636,7 @@ esp_err_t web_portal_try_autostart_from_nvs(bool *started)
     }
 
     /* Initialize syslog only after WiFi is connected to avoid interfering with AP/STA transitions */
-    ret = syslog_init(setup_cfg.broker_ip, 5140);
+    ret = syslog_init(setup_cfg.broker_ip, 514);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Syslog init failed: %s — continuing without syslog", esp_err_to_name(ret));
     }

@@ -122,7 +122,7 @@ static void flush_dosing_queue(const char *reason)
     }
 }
 
-static void safety_publish_faults(safety_fault_mask_t new_faults)
+static void safety_publish_faults(safety_fault_mask_t new_faults, const char *reason)
 {
     if (new_faults == 0) {
         return;
@@ -137,14 +137,15 @@ static void safety_publish_faults(safety_fault_mask_t new_faults)
     ESP_LOGE(TAG, "Safety fault %s: %s (new=%lu)", code, text, (unsigned long)new_faults);
 
     if (s_bindings.safety_fault_topic != NULL && s_bindings.safety_fault_topic[0] != '\0') {
-        char payload[160];
+        char payload[256];
         safety_fault_mask_t mask = (safety_fault_mask_t)atomic_load(&s_safety.faults);
         int written = snprintf(payload, sizeof(payload),
-                               "{\"mask\":%lu,\"code\":\"%s\",\"count\":%d,\"text\":\"%s\"}",
+                               "{\"mask\":%lu,\"code\":\"%s\",\"count\":%d,\"text\":\"%s\",\"reason\":\"%s\"}",
                                (unsigned long)mask,
                                code,
                                count,
-                               text);
+                               text,
+                               reason != NULL ? reason : "");
         if (written > 0 && written < (int)sizeof(payload)) {
             mqtt_manager_publish(s_bindings.safety_fault_topic, payload, 1, 0);
         }
@@ -218,7 +219,7 @@ static void safety_fault_set(safety_fault_mask_t mask, const char *reason)
 
     safety_fault_mask_t reported = (safety_fault_mask_t)atomic_fetch_or(&s_safety.reported_faults, (unsigned int)new_faults);
     safety_fault_mask_t to_report = new_faults & ~reported;
-    safety_publish_faults(to_report);
+    safety_publish_faults(to_report, reason);
 #endif
 }
 
@@ -339,7 +340,7 @@ void runtime_safety_apply_boot_faults(void)
     safety_fault_mask_t existing_faults = (safety_fault_mask_t)atomic_load(&s_safety.faults);
     if (existing_faults != 0) {
         safety_enter_safe_state(existing_faults);
-        safety_publish_faults(existing_faults);
+        safety_publish_faults(existing_faults, NULL);
     }
 }
 
@@ -799,7 +800,7 @@ void runtime_safety_task(void *arg)
                     }
 
                     if (last_tds_valid) {
-                        if (fabsf(snap.tds - last_tds) < SAFETY_TDS_FROZEN_EPSILON) {
+                        if (snap.tds == last_tds) {
                             tds_frozen++;
                         } else {
                             tds_frozen = 0;

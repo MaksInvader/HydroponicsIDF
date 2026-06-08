@@ -54,14 +54,14 @@
 #define SAFETY_PH_CRITICAL_LOW 4.0f
 #define SAFETY_PH_CRITICAL_HIGH 9.0f
 #define SAFETY_PH_RATE_MAX_PER_MIN 1.0f
-#define SAFETY_PH_FROZEN_EPSILON 0.005f
+#define SAFETY_PH_FROZEN_EPSILON 0.0f
 #define SAFETY_PH_FROZEN_SAMPLES 300      /* 150 s — large volume, slow pH drift */
 #define SAFETY_PH_RESPONSE_TIMEOUT_MS 90000
 #define SAFETY_PH_RESPONSE_MIN_DELTA 0.03f
 
 #define SAFETY_TDS_MIN 50.0f
 #define SAFETY_TDS_MAX 2500.0f
-#define SAFETY_TDS_FROZEN_EPSILON 0.5f
+#define SAFETY_TDS_FROZEN_EPSILON 0.0f    /* Fault only when value is literally unchanged */
 #define SAFETY_TDS_FROZEN_SAMPLES 300     /* 150 s — large volume, slow TDS drift */
 #define SAFETY_TDS_OOR_FAULT_MS   10000   /* Require OOR for 10 s continuously before faulting */
 #define SAFETY_TDS_RESPONSE_TIMEOUT_MS 120000
