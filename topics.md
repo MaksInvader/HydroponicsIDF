@@ -22,8 +22,8 @@ Format: `<zone_id>/<channel>/command`
 | `<zone_id>/valve/command` | Main valve |
 | `<zone_id>/PerNutA/command` | Nutrient A peristaltic pump |
 | `<zone_id>/PerNutB/command` | Nutrient B peristaltic pump |
-| `<zone_id>/PerPHUp/command` | pH Up peristaltic pump |
-| `<zone_id>/PerPHDown/command` | pH Down peristaltic pump |
+| `<zone_id>/PerpHUp/command` | pH Up peristaltic pump |
+| `<zone_id>/PerpHDown/command` | pH Down peristaltic pump |
 | `<zone_id>/relay1/command` | Relay 1 |
 | `<zone_id>/relay2/command` | Relay 2 |
 | `<zone_id>/relay3/command` | Relay 3 |
@@ -45,8 +45,8 @@ Format: `<zone_id>/<channel>/status` — QoS 1, retain 0
 | `<zone_id>/valve/status` | `ON` / `OFF` |
 | `<zone_id>/PerNutA/status` | `ON` / `OFF` |
 | `<zone_id>/PerNutB/status` | `ON` / `OFF` |
-| `<zone_id>/PerPHUp/status` | `ON` / `OFF` |
-| `<zone_id>/PerPHDown/status` | `ON` / `OFF` |
+| `<zone_id>/PerpHUp/status` | `ON` / `OFF` |
+| `<zone_id>/PerpHDown/status` | `ON` / `OFF` |
 | `<zone_id>/relay1/status` | `ON` / `OFF` |
 | `<zone_id>/relay2/status` | `ON` / `OFF` |
 | `<zone_id>/relay3/status` | `ON` / `OFF` |

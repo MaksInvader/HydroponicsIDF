@@ -84,6 +84,9 @@ safety_fault_mask_t runtime_safety_get_faults(void);
 bool runtime_safety_is_safe_mode(void);
 esp_err_t runtime_safety_clear_faults(safety_fault_mask_t mask, bool *safe_mode_cleared);
 
+void runtime_safety_set_override(bool active);
+bool runtime_safety_is_override_active(void);
+
 void runtime_safety_task(void *arg);
 
 #ifdef __cplusplus

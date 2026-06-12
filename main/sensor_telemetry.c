@@ -45,6 +45,9 @@
 #include "sensor_calibration_nvs.h"
 #include "sensor_telemetry.h"
 #include "i2c_bus.h"
+#if ENABLE_SHT31
+#include "sht31.h"
+#endif
 
 #if (PH_SOURCE_USE_SERIAL == 1)
 #include "ph_serial.h"
@@ -124,6 +127,8 @@ typedef struct {
     /* Published telemetry topics */
     char water_level_state[TOPIC_BUF_LEN];
     char water_temp_state[TOPIC_BUF_LEN];
+    char room_temp_state[TOPIC_BUF_LEN];
+    char humidity_state[TOPIC_BUF_LEN];
 
     char ph_raw[TOPIC_BUF_LEN];
     char ph_state[TOPIC_BUF_LEN];
@@ -743,6 +748,7 @@ static esp_err_t ads1115_read_ph_median(int *out_raw)
  * Returns ESP_FAIL on the first failing individual read — caller treats the
  * entire batch as failed so no partial data enters the history.
  */
+#if 0
 static esp_err_t ads1115_read_tds_median(int *out_raw)
 {
     if (out_raw == NULL) return ESP_ERR_INVALID_ARG;
@@ -767,6 +773,7 @@ static esp_err_t ads1115_read_tds_median(int *out_raw)
     *out_raw = samples[TDS_MEDIAN_SAMPLES / 2];  /* middle element = median */
     return ESP_OK;
 }
+#endif
 
 
 /* --------------------------------------------------------------------------
@@ -835,6 +842,8 @@ static esp_err_t build_sensor_topics(const char *zone_id)
 {
     WRITE_TOPIC(s_topics.water_level_state, "%s/sensor/WaterLevel/state", zone_id);
     WRITE_TOPIC(s_topics.water_temp_state,  "%s/sensor/WaterTemp/state",  zone_id);
+    WRITE_TOPIC(s_topics.room_temp_state,   "%s/sensor/RoomTemperature/state", zone_id);
+    WRITE_TOPIC(s_topics.humidity_state,    "%s/sensor/Humidity/state",   zone_id);
 
     WRITE_TOPIC(s_topics.ph_raw,   "%s/sensor/pH/raw",   zone_id);
     WRITE_TOPIC(s_topics.ph_state, "%s/sensor/pH/state", zone_id);
@@ -1091,7 +1100,7 @@ static bool validate_cali_payload(const char *payload, int payload_len,
     memcpy(buf, payload, copy_len);
     buf[copy_len] = '\0';
 
-    /* Req 4.1 — must be parseable JSON object (heuristic: starts with '{') */
+    /* Must be a JSON object (heuristic: starts with '{') */
     const char *p = buf;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '{') {
@@ -1099,54 +1108,69 @@ static bool validate_cali_payload(const char *payload, int payload_len,
         return false;
     }
 
-    /* Req 4.4 — mode must be "linear" */
-    if (strstr(buf, "\"mode\"") == NULL) {
-        snprintf(reason_out, 128, "missing field: mode");
+    /* ── Extract two calibration points ─────────────────────────────────── */
+    float actual_1 = 0.0f, actual_2 = 0.0f;
+    float raw_1 = 0.0f, raw_2 = 0.0f;
+
+    if (!json_get_float(buf, "actual_1", &actual_1)) {
+        snprintf(reason_out, 128, "missing field: actual_1");
         return false;
     }
-    if (strstr(buf, "\"linear\"") == NULL) {
-        snprintf(reason_out, 128, "unsupported mode (only linear accepted)");
+    if (!json_get_float(buf, "raw_1", &raw_1)) {
+        snprintf(reason_out, 128, "missing field: raw_1");
+        return false;
+    }
+    if (!json_get_float(buf, "actual_2", &actual_2)) {
+        snprintf(reason_out, 128, "missing field: actual_2");
+        return false;
+    }
+    if (!json_get_float(buf, "raw_2", &raw_2)) {
+        snprintf(reason_out, 128, "missing field: raw_2");
         return false;
     }
 
-    /* Req 4.2 — slope must be present */
-    float slope = 0.0f;
-    if (!json_get_float(buf, "slope", &slope)) {
-        snprintf(reason_out, 128, "missing field: slope");
+    /* All values must be finite */
+    if (!isfinite(actual_1) || !isfinite(raw_1) ||
+        !isfinite(actual_2) || !isfinite(raw_2)) {
+        snprintf(reason_out, 128, "calibration point values must be finite");
         return false;
     }
 
-    /* Req 4.2 — offset must be present */
-    float offset = 0.0f;
-    if (!json_get_float(buf, "offset", &offset)) {
-        snprintf(reason_out, 128, "missing field: offset");
+    /* raw_1 and raw_2 must differ — otherwise slope is undefined */
+    float raw_diff = raw_2 - raw_1;
+    if (raw_diff == 0.0f) {
+        snprintf(reason_out, 128, "raw_1 and raw_2 must differ (division by zero)");
         return false;
     }
 
-    /* Req 4.3 — slope and offset must be finite */
+    /* ── Compute linear coefficients: value = slope * raw + offset ────── */
+    float slope  = (actual_2 - actual_1) / raw_diff;
+    float offset = actual_1 - slope * raw_1;
+
+    /* Computed slope and offset must be finite */
     if (!isfinite(slope)) {
-        snprintf(reason_out, 128, "slope is not finite");
+        snprintf(reason_out, 128, "computed slope is not finite");
         return false;
     }
     if (!isfinite(offset)) {
-        snprintf(reason_out, 128, "offset is not finite");
+        snprintf(reason_out, 128, "computed offset is not finite");
         return false;
     }
 
-    /* Req 4.3 — slope must be non-zero */
+    /* Slope must be non-zero */
     if (slope == 0.0f) {
-        snprintf(reason_out, 128, "slope must be non-zero");
+        snprintf(reason_out, 128, "computed slope is zero (actual_1 == actual_2)");
         return false;
     }
 
-    /* Req 4.5/4.6 — plausible range check */
+    /* Plausible range check on computed coefficients */
     if (slope < range->slope_min || slope > range->slope_max) {
-        snprintf(reason_out, 128, "slope %.4f out of range [%.4f, %.4f]",
+        snprintf(reason_out, 128, "computed slope %.4f out of range [%.4f, %.4f]",
                  (double)slope, (double)range->slope_min, (double)range->slope_max);
         return false;
     }
     if (offset < range->offset_min || offset > range->offset_max) {
-        snprintf(reason_out, 128, "offset %.4f out of range [%.4f, %.4f]",
+        snprintf(reason_out, 128, "computed offset %.4f out of range [%.4f, %.4f]",
                  (double)offset, (double)range->offset_min, (double)range->offset_max);
         return false;
     }
@@ -1154,14 +1178,18 @@ static bool validate_cali_payload(const char *payload, int payload_len,
     out->slope      = slope;
     out->offset     = offset;
     out->valid      = true;
-        /* Prefer the timestamp supplied by the sender (Unix epoch seconds).
-         * Fall back to a boot-relative counter only when the field is absent. */
-        float upd_f = 0.0f;
-        if (json_get_float(buf, "updated_at", &upd_f) && upd_f > 0.0f) {
-            out->updated_at = (uint32_t)upd_f;
-        } else {
-            out->updated_at = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-        }
+    /* Prefer the timestamp supplied by the sender (Unix epoch seconds).
+     * Fall back to a boot-relative counter only when the field is absent. */
+    float upd_f = 0.0f;
+    if (json_get_float(buf, "updated_at", &upd_f) && upd_f > 0.0f) {
+        out->updated_at = (uint32_t)upd_f;
+    } else {
+        out->updated_at = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    }
+
+    ESP_LOGD(TAG, "Cali points: (%.0f,%.0f)(%.0f,%.0f) → s=%.4f o=%.4f",
+             (double)raw_1, (double)actual_1, (double)raw_2, (double)actual_2,
+             (double)slope, (double)offset);
     return true;
 }
 
@@ -1196,7 +1224,7 @@ static void handle_cali_set(const char *payload, int payload_len,
     char reason[128] = {0};
     calibration_t new_cali = {0};
     if (!validate_cali_payload(payload, payload_len, range, &new_cali, reason)) {
-        ESP_LOGW(TAG, "%s calibration rejected: %s", type_name, reason);
+        ESP_LOGW(TAG, "%s cali rejected: %s", type_name, reason);
         publish_cali_error(state_topic, valid_topic, prev_updated_at, reason);
         return;
     }
@@ -1206,9 +1234,8 @@ static void handle_cali_set(const char *payload, int payload_len,
     for (int attempt = 0; attempt <= CALI_NVS_RETRY_COUNT; attempt++) {
         save_ret = nvs_save(&new_cali);
         if (save_ret == ESP_OK) break;
-        ESP_LOGW(TAG, "%s NVS save failed (attempt %d/%d): %s",
-                 type_name, attempt + 1, CALI_NVS_RETRY_COUNT + 1,
-                 esp_err_to_name(save_ret));
+        ESP_LOGD(TAG, "%s NVS save retry %d: %s",
+                 type_name, attempt + 1, esp_err_to_name(save_ret));
     }
 
     if (save_ret != ESP_OK) {
@@ -1236,9 +1263,8 @@ static void handle_cali_set(const char *payload, int payload_len,
     *cali_mem = new_cali;
     portEXIT_CRITICAL(&s_cali_lock);
 
-    ESP_LOGI(TAG, "%s calibration updated: slope=%.4f offset=%.4f updated_at=%lu",
-             type_name, (double)new_cali.slope, (double)new_cali.offset,
-             (unsigned long)new_cali.updated_at);
+    ESP_LOGI(TAG, "%s cali set: s=%.4f o=%.4f",
+             type_name, (double)new_cali.slope, (double)new_cali.offset);
 
     /* --- Req 6: Publish state + valid flag --- */
     publish_cali_state(state_topic, valid_topic, &new_cali);
@@ -1289,12 +1315,11 @@ static esp_err_t subscribe_one_with_retry(const char *topic,
     for (int attempt = 0; attempt <= CALI_SUB_RETRY_COUNT; attempt++) {
         esp_err_t ret = mqtt_manager_subscribe(topic, 1, cb, NULL);
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Subscribed to %s", topic);
+            ESP_LOGD(TAG, "Sub OK: %s", topic);
             return ESP_OK;
         }
-        ESP_LOGW(TAG, "Subscribe to %s failed (attempt %d/%d): %s",
-                 topic, attempt + 1, CALI_SUB_RETRY_COUNT + 1,
-                 esp_err_to_name(ret));
+        ESP_LOGD(TAG, "Sub retry %d %s: %s",
+                 attempt + 1, topic, esp_err_to_name(ret));
         if (attempt < CALI_SUB_RETRY_COUNT) {
             vTaskDelay(pdMS_TO_TICKS(CALI_SUB_RETRY_DELAY_MS));
         }
@@ -1425,8 +1450,7 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
 
         if (!found) {
             /* Req 1.4: no entry in NVS */
-            ESP_LOGW(TAG, "No %s calibration in NVS — sensor invalid until calibrated",
-                     sensors[i].name);
+            ESP_LOGD(TAG, "No %s cali in NVS", sensors[i].name);
             if (mqtt_up) {
                 publish_retained_with_retry(sensors[i].valid_topic, "false");
             } else {
@@ -1441,8 +1465,7 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
                          loaded.offset >= r->offset_min && loaded.offset <= r->offset_max);
 
         if (!loaded.valid || !in_range) {
-            ESP_LOGW(TAG, "%s NVS calibration out of plausible range or invalid flag — discarding",
-                     sensors[i].name);
+            ESP_LOGW(TAG, "%s NVS cali invalid/OOR — discarding", sensors[i].name);
             char reason[128];
             if (!loaded.valid) {
                 snprintf(reason, sizeof(reason), "NVS valid flag is false");
@@ -1469,7 +1492,7 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
         portENTER_CRITICAL(&s_cali_lock);
         *sensors[i].mem = loaded;
         portEXIT_CRITICAL(&s_cali_lock);
-        ESP_LOGI(TAG, "%s calibration loaded from NVS: slope=%.4f offset=%.4f",
+        ESP_LOGD(TAG, "%s NVS cali: s=%.4f o=%.4f",
                  sensors[i].name, (double)loaded.slope, (double)loaded.offset);
 
         /* Req 1.3: publish state */
@@ -1487,8 +1510,7 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
     if (mqtt_manager_is_connected()) {
         ret = subscribe_calibration_topics();
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Calibration subscribe failed at init (%s) — will retry on reconnect",
-                     esp_err_to_name(ret));
+            ESP_LOGD(TAG, "Cali sub deferred: %s", esp_err_to_name(ret));
         }
     }
 
@@ -1616,19 +1638,17 @@ esp_err_t sensor_telemetry_sample(void)
 
     #if (PH_SOURCE_USE_SERIAL == 1)
         {
-            float serial_ph = 0.0f;
             int   serial_raw = 0;
-            esp_err_t serial_ret = ph_serial_read(&serial_raw, &serial_ph);
+            esp_err_t serial_ret = ph_serial_read(&serial_raw);
             if (serial_ret == ESP_OK) {
                 ph_reading.raw = (uint16_t)serial_raw;
                 ph_raw_ok = true;
-                /* Gate on calibration: serial module outputs a pre-scaled pH
+                /* Gate on calibration: serial module outputs a raw ADC
                  * value but we still require a valid calibration entry before
                  * marking the reading valid so safety checks are not triggered
-                 * on an uncalibrated sensor.  Apply the linear model so the
-                 * server-side calibration can trim offset/slope as needed. */
+                 * on an uncalibrated sensor. */
                 if (ph_cali.valid) {
-                    float calibrated = ph_cali.slope * serial_ph + ph_cali.offset;
+                    float calibrated = ph_cali.slope * (float)serial_raw + ph_cali.offset;
                     if (isfinite(calibrated) &&
                         calibrated >= PH_VALUE_MIN &&
                         calibrated <= PH_VALUE_MAX) {
@@ -1698,6 +1718,15 @@ esp_err_t sensor_telemetry_sample(void)
     }
     #endif
 
+    /* ── Environment (SHT31) ───────────────────────────────────────────── */
+    float room_temp = 0.0f;
+    float humidity = 0.0f;
+#if ENABLE_SHT31
+    bool  env_valid = (sht31_read_temp_and_humidity(&room_temp, &humidity) == ESP_OK);
+#else
+    bool  env_valid = false;
+#endif
+
     /* ── Update rolling history & snapshot ────────────────────────────── */
     portENTER_CRITICAL(&s_snapshot_lock);
 
@@ -1724,7 +1753,7 @@ esp_err_t sensor_telemetry_sample(void)
     /* Snapshot is valid as soon as ANY raw read succeeds, regardless of
      * calibration state. This enables /raw publishing before calibration
      * exists — essential for server-side calibration workflow. */
-    s_snapshot.valid = temp_raw_ok || ph_raw_ok || tds_raw_ok;
+    s_snapshot.valid = temp_raw_ok || ph_raw_ok || tds_raw_ok || env_valid;
     s_snapshot.water_level          = water_level ? 1 : 0;
     s_snapshot.water_temp           = average_window(s_temp_history, s_temp_history_count);
 #if ENABLE_WATER_TEMP
@@ -1734,6 +1763,11 @@ esp_err_t sensor_telemetry_sample(void)
     s_snapshot.water_temp_sensor_ok = false;   /* sensor disabled — suppress safety checks */
     s_snapshot.water_temp_sensor_dead = false;
 #endif
+
+    s_snapshot.room_temp       = room_temp;
+    s_snapshot.room_temp_valid = env_valid;
+    s_snapshot.humidity        = humidity;
+    s_snapshot.humidity_valid  = env_valid;
 
     /* Raw counts for pH/TDS are ADS1115 16-bit counts (0–32767).
      * Water-temp is read via DS18B20 1-Wire and has no raw count. */
@@ -1757,6 +1791,8 @@ esp_err_t sensor_telemetry_sample(void)
 
 const char *sensor_telemetry_topic_water_level(void) { return s_topics.water_level_state; }
 const char *sensor_telemetry_topic_water_temp(void)  { return s_topics.water_temp_state;  }
+const char *sensor_telemetry_topic_room_temp(void)   { return s_topics.room_temp_state;   }
+const char *sensor_telemetry_topic_humidity(void)    { return s_topics.humidity_state;    }
 const char *sensor_telemetry_topic_ph(void)          { return s_topics.ph_state;           }
 const char *sensor_telemetry_topic_tds(void)         { return s_topics.tds_state;          }
 const char *sensor_telemetry_topic_ph_raw(void)      { return s_topics.ph_raw;             }

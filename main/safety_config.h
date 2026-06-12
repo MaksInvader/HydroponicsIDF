@@ -41,10 +41,9 @@
 #define SAFETY_TEMP_LOW 10.0f
 #define SAFETY_TEMP_HIGH 36.0f
 #define SAFETY_TEMP_CRITICAL 42.0f
-
-/* Water temp out-of-range fault: fault is latched if the reading stays
- * outside [SAFETY_TEMP_LOW, SAFETY_TEMP_HIGH] continuously for this long. */
-#define SAFETY_TEMP_OOR_FAULT_MS 60000   /* 1 minute */
+#define SAFETY_TEMP_FROZEN_EPSILON 0.02f
+#define SAFETY_TEMP_FROZEN_SAMPLES 300    /* 150 s — large thermal mass changes slowly */
+#define SAFETY_TEMP_OOR_FAULT_MS 60000    /* 1 minute */
 
 /* pH / TDS checks */
 #define SAFETY_ENABLE_PH_TDS_CHECKS 1
@@ -54,16 +53,16 @@
 #define SAFETY_PH_CRITICAL_LOW 4.0f
 #define SAFETY_PH_CRITICAL_HIGH 9.0f
 #define SAFETY_PH_RATE_MAX_PER_MIN 1.0f
-#define SAFETY_PH_FROZEN_EPSILON 0.0f
+#define SAFETY_PH_FROZEN_EPSILON 0.005f
 #define SAFETY_PH_FROZEN_SAMPLES 300      /* 150 s — large volume, slow pH drift */
 #define SAFETY_PH_RESPONSE_TIMEOUT_MS 90000
 #define SAFETY_PH_RESPONSE_MIN_DELTA 0.03f
 
 #define SAFETY_TDS_MIN 50.0f
 #define SAFETY_TDS_MAX 2500.0f
-#define SAFETY_TDS_FROZEN_EPSILON 0.0f    /* Fault only when value is literally unchanged */
+#define SAFETY_TDS_FROZEN_EPSILON 0.5f
 #define SAFETY_TDS_FROZEN_SAMPLES 300     /* 150 s — large volume, slow TDS drift */
-#define SAFETY_TDS_OOR_FAULT_MS   10000   /* Require OOR for 10 s continuously before faulting */
+#define SAFETY_TDS_OOR_FAULT_MS 10000     /* 10 seconds */
 #define SAFETY_TDS_RESPONSE_TIMEOUT_MS 120000
 #define SAFETY_TDS_RESPONSE_MIN_DELTA 5.0f
 

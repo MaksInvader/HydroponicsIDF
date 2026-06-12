@@ -81,6 +81,15 @@ typedef struct {
     uint32_t pulse_ms;
 } dosing_command_t;
 
+/* LCD actuator event — posted from the dosing task at the moment of execution,
+ * drained by the comm task.  Capacity is generous so a burst of commands during
+ * a dosing cycle never drops an event. */
+#define LCD_EVENT_QUEUE_LEN 8
+typedef struct {
+    char channel_name[32];   /* actuator name string */
+    char state_text[16];     /* "ON", "OFF", or "PULSE Xms" */
+    actuator_channel_t channel;
+} lcd_actuator_event_t;
 
 static const char *TAG = "runtime_tasks";
 
@@ -107,8 +116,10 @@ static bool s_safety_topic_subscribed;
 static bool s_ota_latest_subscribed;
 static bool s_ota_trigger_subscribed;
 static bool s_emergency_subscribed;
+static bool s_override_subscribed;
 static char s_zone_command_topic[ZONE_TOPIC_BUFFER_SIZE];
 static char s_emergency_topic[ZONE_TOPIC_BUFFER_SIZE];
+static char s_override_topic[ZONE_TOPIC_BUFFER_SIZE];
 static char s_safety_fault_topic[ZONE_TOPIC_BUFFER_SIZE];
 static char s_safety_clear_topic[ZONE_TOPIC_BUFFER_SIZE];
 static char s_ota_latest_topic[ZONE_TOPIC_BUFFER_SIZE];
@@ -117,9 +128,9 @@ static char s_ota_latest_version[OTA_VERSION_MAX_LEN];
 static char s_zone_id[ZONE_ID_MAX_LEN + 1];
 
 static char s_zone_name[ZONE_NAME_MAX_LEN + 1];
-static actuator_last_command_t s_last_lcd_rendered_cmd;
 static sensor_telemetry_snapshot_t s_last_good_snapshot;
 static bool s_last_good_snapshot_valid;
+static QueueHandle_t s_lcd_event_queue = NULL;
 RTC_DATA_ATTR static uint32_t s_reset_count;
 RTC_DATA_ATTR static uint32_t s_wdt_reset_count;
 
@@ -165,6 +176,7 @@ static void clear_subscription_tracking(void)
     s_ota_latest_subscribed = false;
     s_ota_trigger_subscribed = false;
     s_emergency_subscribed = false;
+    s_override_subscribed = false;
 }
 
 static void signal_task_exit(EventBits_t bit)
@@ -264,7 +276,7 @@ static void publish_current_version(const char *zone_id)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to publish version %s to %s: %s", version, topic, esp_err_to_name(ret));
     } else {
-        ESP_LOGI(TAG, "Published version %s to %s", version, topic);
+        ESP_LOGD(TAG, "Published version %s to %s", version, topic);
     }
 }
 
@@ -508,6 +520,27 @@ static void on_emergency_command(const char *topic, const char *payload, int pay
 #endif
 }
 
+static void on_override_command(const char *topic, const char *payload, int payload_len, void *user_ctx)
+{
+    (void)topic;
+    (void)user_ctx;
+    if (payload == NULL || payload_len <= 0) return;
+
+    char buf[8];
+    int len = (payload_len < (int)(sizeof(buf) - 1)) ? payload_len : (int)(sizeof(buf) - 1);
+    memcpy(buf, payload, (size_t)len);
+    buf[len] = '\0';
+    for (int i = 0; i < len; i++) {
+        buf[i] = (char)toupper((unsigned char)buf[i]);
+    }
+
+    if (strcmp(buf, "ON") == 0) {
+        runtime_safety_set_override(true);
+    } else if (strcmp(buf, "OFF") == 0) {
+        runtime_safety_set_override(false);
+    }
+}
+
 static void on_safety_clear_command(const char *topic, const char *payload, int payload_len, void *user_ctx)
 {
     (void)topic;
@@ -531,6 +564,8 @@ static void on_safety_clear_command(const char *topic, const char *payload, int 
 
     if (strcmp(buf, "CLEAR") == 0 || strcmp(buf, "ALL") == 0) {
         ESP_LOGW(TAG, "Safety CLEAR received — restarting device");
+        s_reset_count = 0;
+        s_wdt_reset_count = 0;
         indicator_led_startup_beep();
         esp_restart();
         return;
@@ -765,6 +800,37 @@ static void dosing_task(void *arg)
                 continue;
             }
 
+#if ENABLE_LCD
+            /* Post LCD event immediately after execution — before the comm task
+             * next wakes up, so no event is ever lost due to polling lag. */
+            if (s_lcd_event_queue != NULL) {
+                lcd_actuator_event_t ev = {0};
+                ev.channel = cmd.channel;
+                const char *name = actuator_control_get_channel_name(cmd.channel);
+                if (name != NULL) {
+                    strncpy(ev.channel_name, name, sizeof(ev.channel_name) - 1);
+                }
+                switch (cmd.action) {
+                case ACTUATOR_ACTION_ON:
+                    strncpy(ev.state_text, "ON", sizeof(ev.state_text) - 1);
+                    break;
+                case ACTUATOR_ACTION_OFF:
+                    strncpy(ev.state_text, "OFF", sizeof(ev.state_text) - 1);
+                    break;
+                case ACTUATOR_ACTION_PULSE:
+                    snprintf(ev.state_text, sizeof(ev.state_text), "PULSE %lums",
+                             (unsigned long)cmd.pulse_ms);
+                    break;
+                default:
+                    strncpy(ev.state_text, "?", sizeof(ev.state_text) - 1);
+                    break;
+                }
+                /* Non-blocking: if full, the oldest event is silently dropped
+                 * (a burst of 8+ commands is rare; the display can't keep up anyway). */
+                xQueueSend(s_lcd_event_queue, &ev, 0);
+            }
+#endif
+
             runtime_safety_dose_watchdog_update(cmd.channel, cmd.action, cmd.pulse_ms);
 
             if (cmd.channel == ACTUATOR_CHANNEL_VALVE) {
@@ -809,7 +875,7 @@ static void sensor_task(void *arg)
         /* Log stack usage periodically to detect gradual leaks */
         if (++loop_count % 100 == 0) {
             stack_hwm = uxTaskGetStackHighWaterMark(NULL);
-            ESP_LOGI(TAG, "Sensor task stack watermark: %u bytes free", (unsigned)(stack_hwm * sizeof(StackType_t)));
+            ESP_LOGD(TAG, "Sensor task stack watermark: %u bytes free", (unsigned)(stack_hwm * sizeof(StackType_t)));
         }
 
         esp_err_t ret = sensor_telemetry_sample();
@@ -845,6 +911,18 @@ static void comm_task_publish_sensors(const sensor_telemetry_snapshot_t *snap,
     /* ── Water temperature ────────────────────────────────────────────── */
     snprintf(buf, sizeof(buf), "%.2f", (double)snap->water_temp);
     mqtt_manager_publish(sensor_telemetry_topic_water_temp(), buf, 0, 0);
+
+    /* ── Environment (SHT31) ──────────────────────────────────────────── */
+#if ENABLE_SHT31
+    if (snap->room_temp_valid) {
+        snprintf(buf, sizeof(buf), "%.2f", (double)snap->room_temp);
+        mqtt_manager_publish(sensor_telemetry_topic_room_temp(), buf, 0, 0);
+    }
+    if (snap->humidity_valid) {
+        snprintf(buf, sizeof(buf), "%.2f", (double)snap->humidity);
+        mqtt_manager_publish(sensor_telemetry_topic_humidity(), buf, 0, 0);
+    }
+#endif
 
     /* ── pH  raw / state / valid ──────────────────────────────────────── */
     snprintf(buf, sizeof(buf), "%u", (unsigned)snap->ph_raw);
@@ -924,47 +1002,37 @@ static void comm_task(void *arg)
         }
 
 #if ENABLE_ACTUATORS && ENABLE_LCD
-        actuator_last_command_t latest_cmd;
-        if (actuator_control_get_last_command(&latest_cmd) == ESP_OK) {
-            if (strcmp(latest_cmd.topic, s_last_lcd_rendered_cmd.topic) != 0 ||
-                strcmp(latest_cmd.command, s_last_lcd_rendered_cmd.command) != 0 ||
-                latest_cmd.state_on != s_last_lcd_rendered_cmd.state_on) {
-                actuator_channel_t channel;
-                char sensor_text[20];
-
-                if (channel_from_name(latest_cmd.channel, &channel) == ESP_OK) {
-                    switch (channel) {
+        /* Drain the LCD event queue — render every event posted by the dosing
+         * task since the last comm cycle.  Non-blocking peek so the comm loop
+         * never stalls. */
+        {
+            lcd_actuator_event_t ev;
+            while (xQueueReceive(s_lcd_event_queue, &ev, 0) == pdTRUE) {
+                char sensor_text[20] = "";
+                if (snapshot_available) {
+                    switch (ev.channel) {
                     case ACTUATOR_CHANNEL_VALVE:
-                        snprintf(sensor_text, sizeof(sensor_text), "WaterLvl: %d", snapshot_available ? snap.water_level : 0);
+                        snprintf(sensor_text, sizeof(sensor_text), "WaterLvl: %d", snap.water_level);
                         break;
                     case ACTUATOR_CHANNEL_PER_NUTA:
                     case ACTUATOR_CHANNEL_PER_NUTB:
-                        snprintf(sensor_text, sizeof(sensor_text), "TDS: %.1f", snapshot_available ? (double)snap.tds : 0.0);
+                        snprintf(sensor_text, sizeof(sensor_text), "TDS: %.1f", (double)snap.tds);
                         break;
                     case ACTUATOR_CHANNEL_PER_PH_UP:
                     case ACTUATOR_CHANNEL_PER_PH_DOWN:
-                        snprintf(sensor_text, sizeof(sensor_text), "pH: %.2f", snapshot_available ? (double)snap.ph : 0.0);
+                        snprintf(sensor_text, sizeof(sensor_text), "pH: %.2f", (double)snap.ph);
                         break;
                     default:
                         snprintf(sensor_text, sizeof(sensor_text), "Sensor: N/A");
                         break;
                     }
-                } else {
-                    snprintf(sensor_text, sizeof(sensor_text), "Sensor: N/A");
                 }
-
-                const char *state_text = (latest_cmd.command[0] != '\0' && strcmp(latest_cmd.command, "N/A") != 0)
-                    ? latest_cmd.command
-                    : (latest_cmd.state_on ? "ON" : "OFF");
-
                 lcd_status_show_actuator_event(
                     s_zone_id,
                     s_zone_name,
-                    latest_cmd.channel,
+                    ev.channel_name[0] != '\0' ? ev.channel_name : "?",
                     sensor_text,
-                    state_text);
-
-                s_last_lcd_rendered_cmd = latest_cmd;
+                    ev.state_text);
             }
         }
 #endif /* ENABLE_ACTUATORS && ENABLE_LCD */
@@ -999,6 +1067,7 @@ static void cleanup_runtime_locked(void)
         { &s_ota_latest_subscribed, s_ota_latest_topic },
         { &s_ota_trigger_subscribed, s_ota_trigger_topic },
         { &s_emergency_subscribed, s_emergency_topic },
+        { &s_override_subscribed, s_override_topic },
     };
     unsubscribe_topics(unsub_entries, ARRAY_SIZE(unsub_entries));
 
@@ -1066,6 +1135,13 @@ static void cleanup_runtime_locked(void)
         s_dosing_queue = NULL;
     }
 
+#if ENABLE_LCD
+    if (s_lcd_event_queue != NULL) {
+        vQueueDelete(s_lcd_event_queue);
+        s_lcd_event_queue = NULL;
+    }
+#endif
+
     if (s_snapshot_mutex != NULL) {
         vSemaphoreDelete(s_snapshot_mutex);
         s_snapshot_mutex = NULL;
@@ -1086,15 +1162,13 @@ static void cleanup_runtime_locked(void)
     s_ota_latest_topic[0] = '\0';
     s_ota_trigger_topic[0] = '\0';
     s_emergency_topic[0] = '\0';
+    s_override_topic[0]  = '\0';
     /* Fix 4: guard s_ota_latest_version against MQTT-task concurrent read */
     portENTER_CRITICAL(&s_ota_version_lock);
     s_ota_latest_version[0] = '\0';
     portEXIT_CRITICAL(&s_ota_version_lock);
 
-    memset(&s_last_lcd_rendered_cmd, 0, sizeof(s_last_lcd_rendered_cmd));
-
-    /* Fix 3: take s_snapshot_mutex before zeroing the snapshot cache so
-     * comm_task cannot be mid-write while cleanup clears the struct. */
+    /* Guard s_last_good_snapshot against comm_task concurrent read during cleanup */
     if (s_snapshot_mutex != NULL) {
         xSemaphoreTake(s_snapshot_mutex, portMAX_DELAY);
     }
@@ -1166,7 +1240,6 @@ static void runtime_prepare_state(const char *zone_id)
     SAFE_STRCPY(s_zone_id, zone_id);
     portEXIT_CRITICAL(&s_zone_id_lock);
 
-    memset(&s_last_lcd_rendered_cmd, 0, sizeof(s_last_lcd_rendered_cmd));
     memset(&s_last_good_snapshot, 0, sizeof(s_last_good_snapshot));
     s_last_good_snapshot_valid = false;
 
@@ -1236,6 +1309,15 @@ static esp_err_t runtime_setup_resources(const char *zone_id)
         return ESP_ERR_NO_MEM;
     }
 
+#if ENABLE_LCD
+    if (s_lcd_event_queue == NULL) {
+        s_lcd_event_queue = xQueueCreate(LCD_EVENT_QUEUE_LEN, sizeof(lcd_actuator_event_t));
+        if (s_lcd_event_queue == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+#endif
+
     if (s_snapshot_mutex == NULL) {
         s_snapshot_mutex = xSemaphoreCreateMutex();
         if (s_snapshot_mutex == NULL) {
@@ -1294,6 +1376,15 @@ static esp_err_t runtime_setup_topics(const char *zone_id)
                                     on_emergency_command, NULL, &s_emergency_subscribed);
     if (ret != ESP_OK) {
         return ret;
+    }
+
+    /* Override topic — suppresses sensor/actuator faults while ON */
+    ret = subscribe_formatted_topic(s_override_topic, ZONE_TOPIC_BUFFER_SIZE,
+                                    "%s/override/command", zone_id, NULL,
+                                    on_override_command, NULL, &s_override_subscribed);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Override subscribe failed: %s — continuing without override support",
+                 esp_err_to_name(ret));
     }
 
     publish_current_version(zone_id);

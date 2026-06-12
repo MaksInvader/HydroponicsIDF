@@ -636,7 +636,7 @@ esp_err_t web_portal_try_autostart_from_nvs(bool *started)
     }
 
     /* Initialize syslog only after WiFi is connected to avoid interfering with AP/STA transitions */
-    ret = syslog_init(setup_cfg.broker_ip, 514);
+    ret = syslog_init("255.255.255.255", 514);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Syslog init failed: %s — continuing without syslog", esp_err_to_name(ret));
     }
@@ -646,9 +646,13 @@ esp_err_t web_portal_try_autostart_from_nvs(bool *started)
         return ret;
     }
 
-    ret = mqtt_manager_publish_setup_and_wait(zone_cfg.zone_id, setup_payload, 15000);
+    /* Zone already registered in NVS — just notify the broker we're back
+     * without waiting for /success confirmation. The broker already knows
+     * this zone; confirmation is only needed on first-time pairing. */
+    ret = mqtt_manager_publish("SetUp", setup_payload, 1, 0);
     if (ret != ESP_OK) {
-        return ret;
+        ESP_LOGW(TAG, "Autostart: SetUp publish failed (%s) — continuing anyway",
+                 esp_err_to_name(ret));
     }
 
     ret = runtime_tasks_start(zone_cfg.zone_id);

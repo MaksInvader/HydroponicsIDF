@@ -17,6 +17,7 @@ idf_component_register(
         "runtime_safety.c"
         "setup_button.c"
        "ph_serial.c"
+        "sht31.c"
         "syslog.c"
     INCLUDE_DIRS "."
     REQUIRES

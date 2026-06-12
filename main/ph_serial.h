@@ -62,7 +62,7 @@ bool ph_serial_is_ready(void);
  *                             or value is outside [0.0, 14.0].
  *         ESP_ERR_INVALID_STATE — ph_serial_init() was never called.
  */
-esp_err_t ph_serial_read(int *out_raw, float *out_ph);
+esp_err_t ph_serial_read(int *out_raw);
 
 #ifdef __cplusplus
 }

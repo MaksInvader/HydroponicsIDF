@@ -50,6 +50,9 @@ esp_err_t syslog_init(const char *host, uint16_t port)
         return ESP_FAIL;
     }
 
+    int broadcast = 1;
+    setsockopt(s_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
     memset(&s_dest_addr, 0, sizeof(s_dest_addr));
     s_dest_addr.sin_family = AF_INET;
     s_dest_addr.sin_port = htons(port);
@@ -61,7 +64,7 @@ esp_err_t syslog_init(const char *host, uint16_t port)
     }
 
     s_prev_vprintf = esp_log_set_vprintf(syslog_vprintf);
-    ESP_LOGI(TAG, "Syslog UDP unicast enabled → %s:%u", host, (unsigned)port);
+    ESP_LOGI(TAG, "Syslog UDP enabled → %s:%u", host, (unsigned)port);
 
     return ESP_OK;
 }

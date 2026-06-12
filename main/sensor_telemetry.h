@@ -21,6 +21,12 @@ typedef struct {
     float    ph;            /* calibrated value (0–14)                        */
     bool     ph_valid;      /* calibration present AND value in sane range    */
 
+    /* Environment */
+    float room_temp;
+    bool  room_temp_valid;
+    float humidity;
+    bool  humidity_valid;
+
     /* TDS */
     uint16_t tds_raw;       /* averaged raw ADC counts                        */
     float    tds;           /* calibrated value (ppm)                         */
@@ -101,6 +107,8 @@ esp_err_t sensor_telemetry_sample(void);
 /* Legacy single-topic accessors (still used by comm_task publish loop) */
 const char *sensor_telemetry_topic_water_level(void);
 const char *sensor_telemetry_topic_water_temp(void);
+const char *sensor_telemetry_topic_room_temp(void);
+const char *sensor_telemetry_topic_humidity(void);
 const char *sensor_telemetry_topic_ph(void);    /* → .../pH/state          */
 const char *sensor_telemetry_topic_tds(void);   /* → .../TDS/state         */
 

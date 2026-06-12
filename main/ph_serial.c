@@ -59,12 +59,6 @@ static ph_parser_state_t s_parser_state = PH_WAITING_HEADER_1;
 static uint8_t           s_data_high_byte = 0;
 static bool              s_has_reading = false;
 static int               s_latest_raw = 0;
-static float             s_latest_ph = 0.0f;
-
-static float raw_to_ph(int raw)
-{
-    return (float)raw / 100.0f;
-}
 
 static void parser_reset(void)
 {
@@ -110,24 +104,18 @@ static void parser_feed_byte(uint8_t byte)
 
     case PH_WAITING_DATA_LOW: {
         int raw = (int)(((uint16_t)s_data_high_byte << 8) | (uint16_t)byte);
-        float ph = raw_to_ph(raw);
-        ESP_LOGI(TAG, "Data low byte: 0x%02X, complete frame: raw=%d ph=%.2f", byte, raw, (double)ph);
-        if (ph >= 0.0f && ph <= 14.0f) {
-            s_latest_raw = raw;
-            s_latest_ph = ph;
-            s_has_reading = true;
-            
-            /* Mark as synchronized on first valid frame */
-            if (!s_synchronized) {
-                s_synchronized = true;
-                ESP_LOGI(TAG, "✓ SYNCHRONIZED with transmitter on first valid frame");
-            }
-            
-            ESP_LOGI(TAG, "pH frame: raw=%d ph=%.2f", raw, (double)ph);
-            gpio_set_level(PIN_PH_SERIAL_DEBUG_LED, !gpio_get_level(PIN_PH_SERIAL_DEBUG_LED));
-        } else {
-            ESP_LOGW(TAG, "✗ pH serial frame out of range: raw=%d ph=%.2f", raw, (double)ph);
+        
+        s_latest_raw = raw;
+        s_has_reading = true;
+        
+        /* Mark as synchronized on first valid frame */
+        if (!s_synchronized) {
+            s_synchronized = true;
+            ESP_LOGI(TAG, "✓ SYNCHRONIZED with transmitter on first valid frame");
         }
+        
+        gpio_set_level(PIN_PH_SERIAL_DEBUG_LED, !gpio_get_level(PIN_PH_SERIAL_DEBUG_LED));
+        
         s_parser_state = PH_WAITING_HEADER_1;
         break;
     }
@@ -285,17 +273,16 @@ bool ph_serial_is_ready(void)
     return s_ready;
 }
 
-esp_err_t ph_serial_read(int *out_raw, float *out_ph)
+esp_err_t ph_serial_read(int *out_raw)
 {
     if (!s_ready)              return ESP_ERR_INVALID_STATE;
-    if (!out_raw || !out_ph)   return ESP_ERR_INVALID_ARG;
+    if (!out_raw)              return ESP_ERR_INVALID_ARG;
 
     if (!s_has_reading) {
         return ESP_ERR_TIMEOUT;
     }
 
     *out_raw = s_latest_raw;
-    *out_ph = s_latest_ph;
     return ESP_OK;
 }
 

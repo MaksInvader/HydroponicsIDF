@@ -220,7 +220,7 @@ esp_err_t wifi_manager_connect_sta(const char *ssid, const char *password, int t
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_event_group,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdTRUE,
+        pdFALSE,   /* Don't auto-clear — WIFI_CONNECTED_BIT must stay set */
         pdFALSE,
         pdMS_TO_TICKS(timeout_ms));
 
@@ -235,11 +235,13 @@ esp_err_t wifi_manager_connect_sta(const char *ssid, const char *password, int t
     if (bits & WIFI_FAIL_BIT) {
         ESP_LOGE(TAG, "Failed to connect to target AP");
         s_sta_auto_reconnect_enabled = false;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
         return ESP_FAIL;
     }
 
     ESP_LOGE(TAG, "Timeout while waiting for AP connection");
     s_sta_auto_reconnect_enabled = false;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
     esp_err_t disc_ret = esp_wifi_disconnect();
     if (disc_ret != ESP_OK && disc_ret != ESP_ERR_WIFI_NOT_CONNECT) {
         ESP_LOGW(TAG, "Disconnect after timeout failed: %s", esp_err_to_name(disc_ret));

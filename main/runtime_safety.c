@@ -65,6 +65,7 @@ static runtime_safety_state_t s_safety = {0};
 static dosing_watchdog_t s_dose_watchdog[ACTUATOR_CHANNEL_COUNT] = {0};
 static bool s_channel_state_on[ACTUATOR_CHANNEL_COUNT] = {0};
 static bool s_gate_open = false;
+static atomic_bool s_override_active = ATOMIC_VAR_INIT(false);
 
 static const safety_fault_info_t s_fault_info[] = {
     { SAFETY_FAULT_DOSE_A, "F-001", "Dose A" },
@@ -502,7 +503,7 @@ void runtime_safety_dose_watchdog_update(actuator_channel_t channel, actuator_ac
     case ACTUATOR_ACTION_PULSE:
         /* A pulse is a self-contained ON+OFF.  Fault immediately if
          * the requested duration already exceeds the maximum. */
-        if (pulse_ms > max_dose) {
+        if (pulse_ms > max_dose && !atomic_load(&s_override_active)) {
             safety_fault_mask_t fault = safety_fault_for_channel(channel);
             if (fault != 0) {
                 safety_fault_set(fault, "Pulse duration exceeded max");
@@ -530,7 +531,7 @@ static void safety_check_dose_durations(TickType_t now)
         }
 
         uint32_t on_duration_ms = ticks_to_ms(now - watchdog->on_tick);
-        if (on_duration_ms > max_dose) {
+        if (on_duration_ms > max_dose && !atomic_load(&s_override_active)) {
             safety_fault_mask_t fault = safety_fault_for_channel((actuator_channel_t)i);
             if (fault != 0) {
                 safety_fault_set(fault, "Pump on-duration exceeded max");
@@ -548,6 +549,16 @@ void runtime_safety_note_ph_dose(actuator_channel_t channel)
 
     sensor_telemetry_snapshot_t snap;
     if (sensor_telemetry_get_snapshot(&snap) != ESP_OK || !snap.valid) {
+        return;
+    }
+
+    /* Skip the response check when the pH reading itself is not valid
+     * (sensor disabled via PH_SOURCE_USE_SERIAL=0, uncalibrated, or serial
+     * read failed).  Without this guard a 90 s timer would be armed even
+     * though there is no live pH signal to monitor, causing a guaranteed
+     * false-positive SAFETY_FAULT_PH_UP/DOWN "pH response timeout" fault. */
+    if (!snap.ph_valid) {
+        ESP_LOGD(TAG, "note_ph_dose: pH sensor not valid — response check skipped");
         return;
     }
 
@@ -572,6 +583,15 @@ void runtime_safety_note_tds_dose(actuator_channel_t channel)
 
     sensor_telemetry_snapshot_t snap;
     if (sensor_telemetry_get_snapshot(&snap) != ESP_OK || !snap.valid) {
+        return;
+    }
+
+    /* Skip the response check when the TDS reading itself is not valid
+     * (sensor disabled or calibration missing).  Without this guard a 120 s
+     * timer would be armed on every nutrient dose even when TDS has no live
+     * signal, causing a guaranteed false-positive response timeout fault. */
+    if (!snap.tds_valid) {
+        ESP_LOGD(TAG, "note_tds_dose: TDS sensor not valid — response check skipped");
         return;
     }
 
@@ -603,6 +623,19 @@ void runtime_safety_note_valve_action(actuator_action_t action)
 void runtime_safety_fault_set(safety_fault_mask_t mask, const char *reason)
 {
     safety_fault_set(mask, reason);
+}
+
+void runtime_safety_set_override(bool active)
+{
+    bool prev = atomic_exchange(&s_override_active, active);
+    if (prev != active) {
+        ESP_LOGI(TAG, "Override mode %s", active ? "ON — sensor/actuator faults suppressed" : "OFF");
+    }
+}
+
+bool runtime_safety_is_override_active(void)
+{
+    return atomic_load(&s_override_active);
 }
 
 safety_fault_mask_t runtime_safety_get_faults(void)
@@ -730,19 +763,15 @@ void runtime_safety_task(void *arg)
                 (snap.water_temp < SAFETY_TEMP_LOW || snap.water_temp > SAFETY_TEMP_HIGH)) {
                 s_safety.water_temp_oor_ticks++;
                 uint32_t oor_ms = (uint32_t)s_safety.water_temp_oor_ticks * SAFETY_INTERVAL_MS;
-                ESP_LOGW(TAG, "Water temp OOR: %.1f C (range %.1f–%.1f C, %lu/%lu ms)",
-                         snap.water_temp,
-                         (float)SAFETY_TEMP_LOW, (float)SAFETY_TEMP_HIGH,
-                         (unsigned long)oor_ms, (unsigned long)SAFETY_TEMP_OOR_FAULT_MS);
-                if (oor_ms >= SAFETY_TEMP_OOR_FAULT_MS) {
+                if (oor_ms >= SAFETY_TEMP_OOR_FAULT_MS && !atomic_load(&s_override_active)) {
                     safety_fault_set(SAFETY_FAULT_WATER_TEMP, "Water temp out of range >1 min");
                 }
             } else {
                 s_safety.water_temp_oor_ticks = 0;
             }
 
-            if (SAFETY_ENABLE_PH_TDS_CHECKS) {
-                /* Only run pH checks when calibration is present and value is valid */
+            if (SAFETY_ENABLE_PH_TDS_CHECKS && !atomic_load(&s_override_active)) {
+                /* pH checks — only when calibration is present and value is valid */
                 if (snap.ph_valid) {
                     if (snap.ph < SAFETY_PH_MIN || snap.ph > SAFETY_PH_MAX) {
                         safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH out of range");
@@ -781,17 +810,11 @@ void runtime_safety_task(void *arg)
                     last_ph_valid = true;
                 }
 
-                /* Only run TDS checks when calibration is present and value is valid */
+                /* TDS checks — only when calibration is present and value is valid */
                 if (snap.tds_valid) {
-                    /* Out-of-range: require sustained OOR for SAFETY_TDS_OOR_FAULT_MS
-                     * before faulting to avoid false trips from transient ADC noise. */
                     if (snap.tds < SAFETY_TDS_MIN || snap.tds > SAFETY_TDS_MAX) {
                         s_safety.tds_oor_ticks++;
                         uint32_t oor_ms = (uint32_t)s_safety.tds_oor_ticks * SAFETY_INTERVAL_MS;
-                        ESP_LOGW(TAG, "TDS OOR: %.1f ppm (range %.0f–%.0f, %lu/%lu ms)",
-                                 snap.tds,
-                                 (float)SAFETY_TDS_MIN, (float)SAFETY_TDS_MAX,
-                                 (unsigned long)oor_ms, (unsigned long)SAFETY_TDS_OOR_FAULT_MS);
                         if (oor_ms >= SAFETY_TDS_OOR_FAULT_MS) {
                             safety_fault_set(SAFETY_FAULT_TDS_SENSOR, "TDS out of range >10 s");
                         }
@@ -814,6 +837,7 @@ void runtime_safety_task(void *arg)
                     last_tds_valid = true;
                 }
 
+                /* pH dose response check */
                 bool ph_pending = false;
                 bool ph_up = false;
                 TickType_t ph_deadline = 0;
@@ -842,6 +866,7 @@ void runtime_safety_task(void *arg)
                     }
                 }
 
+                /* TDS dose response check */
                 bool tds_pending = false;
                 TickType_t tds_deadline = 0;
                 float tds_start = 0.0f;
@@ -870,6 +895,12 @@ void runtime_safety_task(void *arg)
                         portEXIT_CRITICAL(&s_safety_lock);
                     }
                 }
+            } else if (atomic_load(&s_override_active)) {
+                /* Override ON: keep response-pending timers from expiring */
+                portENTER_CRITICAL(&s_safety_lock);
+                s_safety.ph_response_pending  = false;
+                s_safety.tds_response_pending = false;
+                portEXIT_CRITICAL(&s_safety_lock);
             }
 
             TickType_t valve_on_tick = 0;
@@ -879,7 +910,8 @@ void runtime_safety_task(void *arg)
             valve_waiting = s_safety.valve_waiting;
             portEXIT_CRITICAL(&s_safety_lock);
 
-            if (valve_waiting && valve_on_tick != 0 && snap.water_level == 0) {
+            if (valve_waiting && valve_on_tick != 0 && snap.water_level == 0 &&
+                !atomic_load(&s_override_active)) {
                 if (ticks_to_ms(now - valve_on_tick) > SAFETY_FILL_TIMEOUT_MS) {
                     safety_fault_set(SAFETY_FAULT_VALVE, "Valve fill timeout");
                     portENTER_CRITICAL(&s_safety_lock);

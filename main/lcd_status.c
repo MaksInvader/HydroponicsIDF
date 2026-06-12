@@ -327,20 +327,35 @@ static void lcd_scroll_task_fn(void *arg)
 {
     (void)arg;
 
-    char padded[SCROLL_REASON_MAX + SCROLL_GAP + 1];
-    size_t reason_len = strlen(s_scroll_reason);
-    memcpy(padded, s_scroll_reason, reason_len);
-    for (int i = 0; i < SCROLL_GAP; i++) padded[reason_len + i] = ' ';
-    size_t padded_len = reason_len + SCROLL_GAP;
-    padded[padded_len] = '\0';
-
-    bool needs_scroll = (reason_len > (size_t)LCD_COLS);
-    size_t offset = 0;
-
     while (true) {
-        if (xSemaphoreTake(s_lcd_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
+        /* Snapshot the scroll buffers under the lock so an in-place update
+         * from lcd_status_show_fault() is always picked up atomically. */
+        char code_snap[32];
+        char reason_snap[SCROLL_REASON_MAX];
+        if (xSemaphoreTake(s_lcd_lock, pdMS_TO_TICKS(300)) == pdTRUE) {
+            memcpy(code_snap,   s_scroll_code,   sizeof(code_snap));
+            memcpy(reason_snap, s_scroll_reason, sizeof(reason_snap));
+            xSemaphoreGive(s_lcd_lock);
+        } else {
+            /* Couldn't get lock — skip this cycle rather than showing stale text */
+            vTaskDelay(pdMS_TO_TICKS(SCROLL_STEP_MS));
+            continue;
+        }
+
+        /* Rebuild the padded scroll string from the freshly-snapshotted reason */
+        char padded[SCROLL_REASON_MAX + SCROLL_GAP + 1];
+        size_t reason_len = strnlen(reason_snap, sizeof(reason_snap));
+        memcpy(padded, reason_snap, reason_len);
+        for (int i = 0; i < SCROLL_GAP; i++) padded[reason_len + i] = ' ';
+        size_t padded_len = reason_len + SCROLL_GAP;
+        padded[padded_len] = '\0';
+
+        bool needs_scroll = (reason_len > (size_t)LCD_COLS);
+        static size_t offset = 0;   /* persist scroll position across refreshes */
+
+        if (xSemaphoreTake(s_lcd_lock, pdMS_TO_TICKS(300)) == pdTRUE) {
             char code_line[LCD_COLS + 1];
-            snprintf(code_line, sizeof(code_line), "%-.*s", LCD_COLS, s_scroll_code);
+            snprintf(code_line, sizeof(code_line), "%-.*s", LCD_COLS, code_snap);
 
             if (needs_scroll) {
                 char line2[LCD_COLS + 1];
@@ -354,7 +369,7 @@ static void lcd_scroll_task_fn(void *arg)
                 lcd_write_line(3, line3);
             } else {
                 char line2[LCD_COLS + 1];
-                snprintf(line2, sizeof(line2), "%-.*s", LCD_COLS, s_scroll_reason);
+                snprintf(line2, sizeof(line2), "%-.*s", LCD_COLS, reason_snap);
                 lcd_write_line(0, "!!!!!  FAULT  !!!!!");
                 lcd_write_line(1, code_line);
                 lcd_write_line(2, line2);
@@ -407,16 +422,31 @@ void lcd_status_show_setup(const char *ip)
 void lcd_status_show_fault(const char *fault_code, const char *reason)
 {
     if (!s_lcd_ready) return;
-    lcd_stop_scroll();
 
-    /* Copy code and reason into scroll buffers before creating the task */
-    snprintf(s_scroll_code,   sizeof(s_scroll_code),   "%s",
-             (fault_code != NULL) ? fault_code : "FAULT");
-    snprintf(s_scroll_reason, sizeof(s_scroll_reason), "%s",
-             (reason != NULL && reason[0] != '\0') ? reason : "Unknown reason");
+    /* Update the scroll buffers under the LCD lock so the scroll task
+     * (if already running) picks up the new text on its next refresh cycle.
+     * This means a second fault always displaces the first on-screen. */
+    if (s_lcd_lock != NULL) {
+        if (xSemaphoreTake(s_lcd_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+            snprintf(s_scroll_code,   sizeof(s_scroll_code),   "%s",
+                     (fault_code != NULL) ? fault_code : "FAULT");
+            snprintf(s_scroll_reason, sizeof(s_scroll_reason), "%s",
+                     (reason != NULL && reason[0] != '\0') ? reason : "Unknown reason");
+            xSemaphoreGive(s_lcd_lock);
+        }
+    } else {
+        snprintf(s_scroll_code,   sizeof(s_scroll_code),   "%s",
+                 (fault_code != NULL) ? fault_code : "FAULT");
+        snprintf(s_scroll_reason, sizeof(s_scroll_reason), "%s",
+                 (reason != NULL && reason[0] != '\0') ? reason : "Unknown reason");
+    }
 
-    xTaskCreate(lcd_scroll_task_fn, "lcd_scroll", SCROLL_TASK_STACK,
-                NULL, SCROLL_TASK_PRIO, &s_scroll_task);
+    /* Only create the scroll task if one isn't already running.
+     * If it's already running, updating the buffers above is enough. */
+    if (s_scroll_task == NULL) {
+        xTaskCreate(lcd_scroll_task_fn, "lcd_scroll", SCROLL_TASK_STACK,
+                    NULL, SCROLL_TASK_PRIO, &s_scroll_task);
+    }
 }
 
 void lcd_status_show_emergency(void)
