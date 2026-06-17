@@ -142,8 +142,11 @@ static void lcd_show_lines(const char *line0, const char *line1, const char *lin
     }
 
     lcd_write_line(0, (line0 != NULL) ? line0 : "");
+    vTaskDelay(pdMS_TO_TICKS(2));
     lcd_write_line(1, (line1 != NULL) ? line1 : "");
+    vTaskDelay(pdMS_TO_TICKS(2));
     lcd_write_line(2, (line2 != NULL) ? line2 : "");
+    vTaskDelay(pdMS_TO_TICKS(2));
     lcd_write_line(3, (line3 != NULL) ? line3 : "");
 
     if (s_lcd_lock != NULL) {
@@ -310,6 +313,7 @@ void lcd_status_show_actuator_event(const char *zone_id, const char *zone_name, 
 #define SCROLL_TASK_PRIO    1
 
 static TaskHandle_t s_scroll_task   = NULL;
+static volatile bool s_scroll_run   = false;
 static char         s_scroll_reason[SCROLL_REASON_MAX];
 static char         s_scroll_code[32];
 
@@ -327,7 +331,7 @@ static void lcd_scroll_task_fn(void *arg)
 {
     (void)arg;
 
-    while (true) {
+    while (s_scroll_run) {
         /* Snapshot the scroll buffers under the lock so an in-place update
          * from lcd_status_show_fault() is always picked up atomically. */
         char code_snap[32];
@@ -364,15 +368,21 @@ static void lcd_scroll_task_fn(void *arg)
                 scroll_fill_line(line3, sizeof(line3), padded, padded_len,
                                  (offset + LCD_COLS) % padded_len);
                 lcd_write_line(0, "!!!!!  FAULT  !!!!!");
+                vTaskDelay(pdMS_TO_TICKS(2));
                 lcd_write_line(1, code_line);
+                vTaskDelay(pdMS_TO_TICKS(2));
                 lcd_write_line(2, line2);
+                vTaskDelay(pdMS_TO_TICKS(2));
                 lcd_write_line(3, line3);
             } else {
                 char line2[LCD_COLS + 1];
                 snprintf(line2, sizeof(line2), "%-.*s", LCD_COLS, reason_snap);
                 lcd_write_line(0, "!!!!!  FAULT  !!!!!");
+                vTaskDelay(pdMS_TO_TICKS(2));
                 lcd_write_line(1, code_line);
+                vTaskDelay(pdMS_TO_TICKS(2));
                 lcd_write_line(2, line2);
+                vTaskDelay(pdMS_TO_TICKS(2));
                 lcd_write_line(3, "");
             }
             xSemaphoreGive(s_lcd_lock);
@@ -383,13 +393,18 @@ static void lcd_scroll_task_fn(void *arg)
         }
         vTaskDelay(pdMS_TO_TICKS(SCROLL_STEP_MS));
     }
+
+    /* Graceful exit */
+    s_scroll_task = NULL;
+    vTaskDelete(NULL);
 }
 
 static void lcd_stop_scroll(void)
 {
     if (s_scroll_task != NULL) {
-        vTaskDelete(s_scroll_task);
-        s_scroll_task = NULL;
+        s_scroll_run = false;
+        /* Don't forcibly delete the task as it might be holding the I2C 
+         * bus mutex. It will gracefully clean itself up on the next cycle. */
     }
 }
 
@@ -444,6 +459,7 @@ void lcd_status_show_fault(const char *fault_code, const char *reason)
     /* Only create the scroll task if one isn't already running.
      * If it's already running, updating the buffers above is enough. */
     if (s_scroll_task == NULL) {
+        s_scroll_run = true;
         xTaskCreate(lcd_scroll_task_fn, "lcd_scroll", SCROLL_TASK_STACK,
                     NULL, SCROLL_TASK_PRIO, &s_scroll_task);
     }

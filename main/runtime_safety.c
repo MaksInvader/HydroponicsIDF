@@ -152,10 +152,9 @@ static void safety_publish_faults(safety_fault_mask_t new_faults, const char *re
         }
     }
 
-    /* Skip the fault screen if we are already in emergency/safe mode —
-     * safety_enter_safe_state() has already shown lcd_status_show_emergency()
-     * and we must not overwrite it with a generic fault code. */
-    if (code != NULL && !atomic_load(&s_safety.safe_mode)) {
+    /* Skip the fault screen if code is NULL. Otherwise, show the fault code
+     * which overwrites the generic EMERGENCY STOP screen with useful details. */
+    if (code != NULL) {
         lcd_status_show_fault(code, text != NULL ? text : "");
     }
 }
@@ -718,12 +717,13 @@ void runtime_safety_task(void *arg)
     TickType_t comm_last_change = last_wake;
 
     float last_ph = 0.0f;
+    float rate_last_ph = 0.0f;
     float last_tds = 0.0f;
     bool last_ph_valid = false;
     bool last_tds_valid = false;
     int ph_frozen = 0;
     int tds_frozen = 0;
-    TickType_t last_ph_tick = last_wake;
+    TickType_t rate_last_ph_tick = last_wake;
 
     while (s_bindings.stop_requested != NULL && !atomic_load(s_bindings.stop_requested)) {
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SAFETY_INTERVAL_MS));
@@ -773,40 +773,52 @@ void runtime_safety_task(void *arg)
             if (SAFETY_ENABLE_PH_TDS_CHECKS && !atomic_load(&s_override_active)) {
                 /* pH checks — only when calibration is present and value is valid */
                 if (snap.ph_valid) {
-                    if (snap.ph < SAFETY_PH_MIN || snap.ph > SAFETY_PH_MAX) {
-                        safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH out of range");
-                    }
+                    bool warmup_active = ticks_to_ms(now - last_wake) < SAFETY_PH_WARMUP_MS;
 
-                    if (snap.ph > SAFETY_PH_CRITICAL_HIGH) {
-                        safety_fault_set(SAFETY_FAULT_PH_UP, "pH critical high");
-                    } else if (snap.ph < SAFETY_PH_CRITICAL_LOW) {
-                        safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH critical low");
+                    if (!warmup_active) {
+                        if (snap.ph < SAFETY_PH_MIN || snap.ph > SAFETY_PH_MAX) {
+                            safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH out of range");
+                        }
+
+                        if (snap.ph > SAFETY_PH_CRITICAL_HIGH) {
+                            safety_fault_set(SAFETY_FAULT_PH_UP, "pH critical high");
+                        } else if (snap.ph < SAFETY_PH_CRITICAL_LOW) {
+                            safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH critical low");
+                        }
                     }
 
                     if (last_ph_valid) {
-                        float delta = snap.ph - last_ph;
-                        float dt_min = (float)ticks_to_ms(now - last_ph_tick) / 60000.0f;
-                        if (dt_min > 0.0f) {
-                            float rate = delta / dt_min;
-                            if (rate > SAFETY_PH_RATE_MAX_PER_MIN) {
-                                safety_fault_set(SAFETY_FAULT_PH_UP, "pH rising too fast");
-                            } else if (rate < -SAFETY_PH_RATE_MAX_PER_MIN) {
-                                safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH dropping too fast");
+                        float rate_dt_min = (float)ticks_to_ms(now - rate_last_ph_tick) / 60000.0f;
+                        if (rate_dt_min >= 1.0f) {
+                            float rate_delta = snap.ph - rate_last_ph;
+                            float rate = rate_delta / rate_dt_min;
+                            if (!warmup_active) {
+                                if (rate > SAFETY_PH_RATE_MAX_PER_MIN) {
+                                    safety_fault_set(SAFETY_FAULT_PH_UP, "pH rising too fast");
+                                } else if (rate < -SAFETY_PH_RATE_MAX_PER_MIN) {
+                                    safety_fault_set(SAFETY_FAULT_PH_DOWN, "pH dropping too fast");
+                                }
                             }
+                            rate_last_ph = snap.ph;
+                            rate_last_ph_tick = now;
                         }
 
+                        float delta = snap.ph - last_ph;
                         if (fabsf(delta) < SAFETY_PH_FROZEN_EPSILON) {
                             ph_frozen++;
                         } else {
                             ph_frozen = 0;
                         }
-                        if (ph_frozen >= SAFETY_PH_FROZEN_SAMPLES) {
+                        if (!warmup_active && ph_frozen >= SAFETY_PH_FROZEN_SAMPLES) {
                             safety_fault_set(SAFETY_FAULT_PH_SENSOR, "pH sensor frozen");
                         }
                     }
 
                     last_ph = snap.ph;
-                    last_ph_tick = now;
+                    if (!last_ph_valid) {
+                        rate_last_ph = snap.ph;
+                        rate_last_ph_tick = now;
+                    }
                     last_ph_valid = true;
                 }
 

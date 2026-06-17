@@ -15,7 +15,7 @@ esp_err_t sht31_read_temp_and_humidity(float *out_temp, float *out_humidity)
     uint8_t cmd[2] = {0x24, 0x00}; // Single shot, high repeatability, no clock stretching
 
     /* 1. Send measurement command */
-    ret = i2c_bus_lock(pdMS_TO_TICKS(100));
+    ret = i2c_bus_lock(pdMS_TO_TICKS(500));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to lock I2C bus for write");
         return ret;
@@ -40,7 +40,7 @@ esp_err_t sht31_read_temp_and_humidity(float *out_temp, float *out_humidity)
     vTaskDelay(pdMS_TO_TICKS(20));
 
     /* 3. Read results */
-    ret = i2c_bus_lock(pdMS_TO_TICKS(100));
+    ret = i2c_bus_lock(pdMS_TO_TICKS(500));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to lock I2C bus for read");
         return ret;

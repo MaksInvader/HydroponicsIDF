@@ -239,7 +239,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 }
 
 /* ── init / deinit ───────────────────────────────────────────────────────── */
-esp_err_t mqtt_manager_init(const char *broker_ip, int broker_port)
+esp_err_t mqtt_manager_init(const char *broker_ip, int broker_port, uint32_t wait_timeout_ms)
 {
     if (broker_ip == NULL || strlen(broker_ip) == 0 ||
         broker_port <= 0 || broker_port > 65535) {
@@ -284,6 +284,7 @@ esp_err_t mqtt_manager_init(const char *broker_ip, int broker_port)
         .network.reconnect_timeout_ms  = 5000,
         .network.disable_auto_reconnect = false,
         .session.keepalive             = 30,
+        .session.disable_clean_session = true,
         .task.stack_size               = 8192,
     };
 
@@ -299,7 +300,7 @@ esp_err_t mqtt_manager_init(const char *broker_ip, int broker_port)
 
     EventBits_t bits = xEventGroupWaitBits(s_event_group, MQTT_CONNECTED_BIT,
                                            pdFALSE, pdTRUE,
-                                           pdMS_TO_TICKS(10000));
+                                           pdMS_TO_TICKS(wait_timeout_ms));
     if ((bits & MQTT_CONNECTED_BIT) == 0) {
         ESP_LOGE(TAG, "MQTT connect timeout");
         return ESP_ERR_TIMEOUT;

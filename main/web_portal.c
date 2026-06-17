@@ -10,6 +10,9 @@
 #include "freertos/task.h"
 #include "syslog.h"
 
+#include "nvs.h"
+#include "nvs_flash.h"
+
 #include "actuator_control.h"
 #include "mqtt_manager.h"
 #include "runtime_tasks.h"
@@ -268,7 +271,7 @@ static portal_setup_result_t start_runtime_with_request(const portal_request_t *
         return PORTAL_SETUP_WIFI_FAILED;
     }
 
-    esp_err_t mqtt_init_ret = mqtt_manager_init(req->broker_ip, req->broker_port);
+    esp_err_t mqtt_init_ret = mqtt_manager_init(req->broker_ip, req->broker_port, 15000);
     if (mqtt_init_ret != ESP_OK) {
         return PORTAL_SETUP_MQTT_INIT_FAILED;
     }
@@ -414,6 +417,15 @@ static esp_err_t configure_post_handler(httpd_req_t *req)
     esp_err_t save_setup_ret = setup_config_save(&setup_cfg);
     if (save_setup_ret != ESP_OK) {
         ESP_LOGW(TAG, "Runtime started, but failed to persist setup profile: %s", esp_err_to_name(save_setup_ret));
+    }
+
+    /* Reset wifi_tries to 0 since a successful new configuration was provided */
+    nvs_handle_t handle;
+    if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_i32(handle, "wifi_tries", 0);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Reset wifi_tries to 0 after successful portal setup");
     }
 
     /* Send the HTTP response before restarting so the browser receives it. */
@@ -624,14 +636,36 @@ esp_err_t web_portal_try_autostart_from_nvs(bool *started)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    ESP_LOGI(TAG, "Autostart: trying saved Wi-Fi '%s' and zone '%s'", setup_cfg.ssid, zone_cfg.zone_id);
+    int32_t wifi_tries = 0;
+    nvs_handle_t handle;
+    if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_get_i32(handle, "wifi_tries", &wifi_tries);
+        nvs_close(handle);
+    }
 
-    /* 7-minute timeout — gives routers time to come back up after a power cut
-     * before the device gives up and falls into setup mode. */
-    ret = wifi_manager_connect_sta(setup_cfg.ssid, setup_cfg.password, 7 * 60 * 1000);
+    if (wifi_tries >= 5) {
+        ESP_LOGE(TAG, "Autostart: wifi_tries >= 5. Dropping to Setup Mode.");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Autostart: trying saved Wi-Fi '%s' and zone '%s' (Attempt %ld/5)",
+             setup_cfg.ssid, zone_cfg.zone_id, (long)wifi_tries + 1);
+
+    TickType_t start_ticks = xTaskGetTickCount();
+
+    /* 2-minute total timeout for both Wi-Fi and MQTT */
+    ret = wifi_manager_connect_sta(setup_cfg.ssid, setup_cfg.password, 2 * 60 * 1000);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Autostart: WiFi connect failed after 7 min (%s) — falling back to setup mode",
+        ESP_LOGW(TAG, "Autostart: WiFi connect failed (%s) — incrementing wifi_tries and rebooting",
                  esp_err_to_name(ret));
+        
+        if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+            nvs_set_i32(handle, "wifi_tries", wifi_tries + 1);
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
+        
+        esp_restart();
         return ret;
     }
 
@@ -641,9 +675,31 @@ esp_err_t web_portal_try_autostart_from_nvs(bool *started)
         ESP_LOGW(TAG, "Syslog init failed: %s — continuing without syslog", esp_err_to_name(ret));
     }
 
-    ret = mqtt_manager_init(setup_cfg.broker_ip, setup_cfg.broker_port);
+    uint32_t elapsed_ms = (xTaskGetTickCount() - start_ticks) * portTICK_PERIOD_MS;
+    uint32_t remaining_ms = (120000 > elapsed_ms) ? (120000 - elapsed_ms) : 1000;
+
+    ret = mqtt_manager_init(setup_cfg.broker_ip, setup_cfg.broker_port, remaining_ms);
     if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Autostart: MQTT server connect failed (%s) — incrementing wifi_tries and rebooting",
+                 esp_err_to_name(ret));
+                 
+        if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+            nvs_set_i32(handle, "wifi_tries", wifi_tries + 1);
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
+        
+        esp_restart();
         return ret;
+    }
+
+    /* Success! Both Wi-Fi and Server connected. Reset wifi_tries to 0 */
+    if (wifi_tries > 0) {
+        if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+            nvs_set_i32(handle, "wifi_tries", 0);
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
     }
 
     /* Zone already registered in NVS — just notify the broker we're back

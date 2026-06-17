@@ -14,7 +14,7 @@
 #define SAFETY_TASK_STACK 6144
 #define SAFETY_TASK_PRIORITY 4
 #define SAFETY_INTERVAL_MS 500
-#define SAFETY_HEARTBEAT_TIMEOUT_MS 5000
+#define SAFETY_HEARTBEAT_TIMEOUT_MS 15000
 
 /* Watchdog and reset resilience */
 #define SAFETY_WDT_TIMEOUT_SEC 8
@@ -47,6 +47,8 @@
 
 /* pH / TDS checks */
 #define SAFETY_ENABLE_PH_TDS_CHECKS 1
+
+#define SAFETY_PH_WARMUP_MS 120000        /* 2 minutes warmup to prevent false flags at boot */
 
 #define SAFETY_PH_MIN 4.5f
 #define SAFETY_PH_MAX 8.5f

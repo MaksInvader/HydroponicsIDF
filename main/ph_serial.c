@@ -197,7 +197,7 @@ esp_err_t ph_serial_init(void)
                               0,       /* TX buffer — 0 = blocking */
                               0,       /* event queue size */
                               NULL,    /* event queue handle */
-                              ESP_INTR_FLAG_IRAM);  /* IRAM interrupt for DMA performance */
+                              0);      /* No IRAM flag, prevents warning */
     if (ret == ESP_ERR_INVALID_STATE) {
         /* Driver already installed — treat as success */
         ret = ESP_OK;

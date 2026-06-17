@@ -26,6 +26,8 @@ typedef struct {
     bool  room_temp_valid;
     float humidity;
     bool  humidity_valid;
+    float vpd;
+    bool  vpd_valid;
 
     /* TDS */
     uint16_t tds_raw;       /* averaged raw ADC counts                        */
@@ -109,6 +111,7 @@ const char *sensor_telemetry_topic_water_level(void);
 const char *sensor_telemetry_topic_water_temp(void);
 const char *sensor_telemetry_topic_room_temp(void);
 const char *sensor_telemetry_topic_humidity(void);
+const char *sensor_telemetry_topic_vpd(void);
 const char *sensor_telemetry_topic_ph(void);    /* → .../pH/state          */
 const char *sensor_telemetry_topic_tds(void);   /* → .../TDS/state         */
 

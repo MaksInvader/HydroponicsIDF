@@ -7,6 +7,9 @@
 #include "esp_log.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include <fcntl.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "syslog";
 
@@ -28,10 +31,12 @@ static int syslog_vprintf(const char *fmt, va_list ap)
     }
 
     if (s_sock >= 0 && len > 0) {
-        if (len >= (int)sizeof(buf)) {
-            len = (int)sizeof(buf) - 1;
+        if (!xPortInIsrContext()) {
+            if (len >= (int)sizeof(buf)) {
+                len = (int)sizeof(buf) - 1;
+            }
+            sendto(s_sock, buf, len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
         }
-        sendto(s_sock, buf, len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
     }
 
     return len;
@@ -48,6 +53,13 @@ esp_err_t syslog_init(const char *host, uint16_t port)
     if (s_sock < 0) {
         ESP_LOGE(TAG, "Failed to create UDP socket");
         return ESP_FAIL;
+    }
+
+    /* Configure socket as non-blocking so ESP_LOG calls don't freeze 
+     * if the network buffers are full or ARP is blocking. */
+    int flags = fcntl(s_sock, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(s_sock, F_SETFL, flags | O_NONBLOCK);
     }
 
     int broadcast = 1;

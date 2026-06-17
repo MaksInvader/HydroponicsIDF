@@ -44,7 +44,7 @@
 #define SAFETY_TASK_PRIORITY 4
 
 #define SENSOR_SAMPLE_INTERVAL_MS 2000
-#define COMM_INTERVAL_MS 1000
+#define COMM_INTERVAL_MS 3000
 #define VERSION_PUBLISH_INTERVAL_MS 30000
 #define DOSING_QUEUE_RECV_TIMEOUT_MS 200
 
@@ -907,48 +907,63 @@ static void comm_task_publish_sensors(const sensor_telemetry_snapshot_t *snap,
     /* ── Water level ──────────────────────────────────────────────────── */
     snprintf(buf, sizeof(buf), "%d", snap->water_level);
     mqtt_manager_publish(sensor_telemetry_topic_water_level(), buf, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     /* ── Water temperature ────────────────────────────────────────────── */
     snprintf(buf, sizeof(buf), "%.2f", (double)snap->water_temp);
     mqtt_manager_publish(sensor_telemetry_topic_water_temp(), buf, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     /* ── Environment (SHT31) ──────────────────────────────────────────── */
 #if ENABLE_SHT31
     if (snap->room_temp_valid) {
         snprintf(buf, sizeof(buf), "%.2f", (double)snap->room_temp);
         mqtt_manager_publish(sensor_telemetry_topic_room_temp(), buf, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (snap->humidity_valid) {
         snprintf(buf, sizeof(buf), "%.2f", (double)snap->humidity);
         mqtt_manager_publish(sensor_telemetry_topic_humidity(), buf, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (snap->vpd_valid) {
+        snprintf(buf, sizeof(buf), "%.2f", (double)snap->vpd);
+        mqtt_manager_publish(sensor_telemetry_topic_vpd(), buf, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 #endif
 
     /* ── pH  raw / state / valid ──────────────────────────────────────── */
     snprintf(buf, sizeof(buf), "%u", (unsigned)snap->ph_raw);
     mqtt_manager_publish(sensor_telemetry_topic_ph_raw(), buf, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     /* Req 7.3/7.4: suppress pH/state when calibration is invalid */
     if (snap->ph_valid) {
         snprintf(buf, sizeof(buf), "%.2f", (double)snap->ph);
         mqtt_manager_publish(sensor_telemetry_topic_ph(), buf, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     mqtt_manager_publish(sensor_telemetry_topic_ph_valid(),
                          snap->ph_valid ? "true" : "false", 0, /*retain=*/1);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     /* ── TDS  raw / state / valid ─────────────────────────────────────── */
     snprintf(buf, sizeof(buf), "%u", (unsigned)snap->tds_raw);
     mqtt_manager_publish(sensor_telemetry_topic_tds_raw(), buf, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     /* Req 7.3/7.4: suppress TDS/state when calibration is invalid */
     if (snap->tds_valid) {
         snprintf(buf, sizeof(buf), "%.1f", (double)snap->tds);
         mqtt_manager_publish(sensor_telemetry_topic_tds(), buf, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     mqtt_manager_publish(sensor_telemetry_topic_tds_valid(),
                          snap->tds_valid ? "true" : "false", 0, /*retain=*/1);
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 static void comm_task(void *arg)

@@ -48,6 +48,7 @@
 
 void setup_button_init(void)
 {
+#if ENABLE_SETUP_BUTTON
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << PIN_SETUP_BUTTON),
         .mode         = GPIO_MODE_INPUT,
@@ -57,12 +58,20 @@ void setup_button_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
     ESP_LOGI(TAG, "Setup button initialised on GPIO%d", PIN_SETUP_BUTTON);
+#else
+    ESP_LOGI(TAG, "Setup button disabled via pin_config.h");
+#endif
 }
 
 /* -------------------------------------------------------------------------- */
 
 void setup_button_wait_for_hold(uint32_t hold_ms)
 {
+#if !ENABLE_SETUP_BUTTON
+    ESP_LOGI(TAG, "Setup button disabled — skipping hold wait");
+    return;
+#endif
+
     ESP_LOGI(TAG, "Waiting for setup button hold (%lu ms)...", (unsigned long)hold_ms);
 
     uint32_t held_ticks    = 0;
@@ -170,11 +179,19 @@ static void button_monitor_task(void *arg)
 
 void setup_button_start_monitor(void)
 {
-    BaseType_t ret = xTaskCreate(button_monitor_task, "btn_monitor",
-                                 4096, NULL, 3, NULL);
+#if ENABLE_SETUP_BUTTON
+    BaseType_t ret = xTaskCreate(
+        button_monitor_task,
+        "setup_btn_mon",
+        2048,
+        NULL,
+        1,
+        NULL
+    );
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create button monitor task");
     } else {
         ESP_LOGI(TAG, "Button monitor task started");
     }
+#endif
 }

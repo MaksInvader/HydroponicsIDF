@@ -83,8 +83,8 @@
 
 /** After the sensor has been declared dead (fail count >= SENSOR_TEMP_FAIL_THRESHOLD),
  * attempt a full bus reinit every this many samples to self-recover without
- * requiring a device restart (~5 min at 2-second sample rate). */
-#define OW_DEAD_RETRY_INTERVAL      150
+ * requiring a device restart. */
+#define OW_DEAD_RETRY_INTERVAL      15
 
 /** Valid physical ranges — readings outside these mark the reading invalid. */
 #define PH_VALUE_MIN            0.0f
@@ -129,6 +129,7 @@ typedef struct {
     char water_temp_state[TOPIC_BUF_LEN];
     char room_temp_state[TOPIC_BUF_LEN];
     char humidity_state[TOPIC_BUF_LEN];
+    char vpd_state[TOPIC_BUF_LEN];
 
     char ph_raw[TOPIC_BUF_LEN];
     char ph_state[TOPIC_BUF_LEN];
@@ -429,14 +430,13 @@ static void ow_reinit(void)
     ow_deinit();
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* Reset ALL failure counters unconditionally BEFORE attempting init.
-     * This prevents a reinit storm: without this, a failed reinit leaves
-     * s_ow_reinit_fail_count >= OW_REINIT_AFTER_N_FAILURES, so the very
-     * next trigger failure immediately calls ow_reinit() again instead of
-     * allowing the 5-failure backoff window to apply fresh. */
+    /* Reset the trigger/read backoff counter unconditionally BEFORE attempting init.
+     * This prevents a reinit storm from normal reads.
+     * We purposefully DO NOT reset s_temp_fail_count or s_ow_dead_retry_count here,
+     * so that if reinit fails, the recovery logic in sensor_telemetry_sample()
+     * will maintain the correct backoff interval instead of being forced to
+     * wait the full SENSOR_TEMP_FAIL_THRESHOLD again. */
     s_ow_reinit_fail_count = 0;
-    s_temp_fail_count      = 0;
-    s_ow_dead_retry_count  = 0;
 
     ow_init();
     if (s_ow_ready) {
@@ -844,6 +844,7 @@ static esp_err_t build_sensor_topics(const char *zone_id)
     WRITE_TOPIC(s_topics.water_temp_state,  "%s/sensor/WaterTemp/state",  zone_id);
     WRITE_TOPIC(s_topics.room_temp_state,   "%s/sensor/RoomTemperature/state", zone_id);
     WRITE_TOPIC(s_topics.humidity_state,    "%s/sensor/Humidity/state",   zone_id);
+    WRITE_TOPIC(s_topics.vpd_state,         "%s/VPD",                     zone_id);
 
     WRITE_TOPIC(s_topics.ph_raw,   "%s/sensor/pH/raw",   zone_id);
     WRITE_TOPIC(s_topics.ph_state, "%s/sensor/pH/state", zone_id);
@@ -901,6 +902,12 @@ static esp_err_t ensure_sensor_interfaces(void)
     #if ENABLE_WATER_TEMP
     /* DS18B20 1-Wire (water temperature) */
     ow_init();
+
+    if (!s_ow_ready) {
+        /* If init failed, start the retry countdown immediately instead of waiting
+         * SENSOR_TEMP_FAIL_THRESHOLD samples before starting the dead sensor backoff. */
+        s_temp_fail_count = SENSOR_TEMP_FAIL_THRESHOLD;
+    }
 
     /* Trigger the first conversion immediately so the very first
      * sample_water_temp() call one cycle later has a result ready. */
@@ -1609,6 +1616,7 @@ esp_err_t sensor_telemetry_sample(void)
             if (s_ow_dead_retry_count >= OW_DEAD_RETRY_INTERVAL) {
                 ESP_LOGW(TAG, "DS18B20 dead for %d samples — attempting recovery reinit",
                          SENSOR_TEMP_FAIL_THRESHOLD + s_ow_dead_retry_count);
+                s_ow_dead_retry_count = 0;
                 ow_reinit();
             }
         }
@@ -1649,9 +1657,9 @@ esp_err_t sensor_telemetry_sample(void)
                  * on an uncalibrated sensor. */
                 if (ph_cali.valid) {
                     float calibrated = ph_cali.slope * (float)serial_raw + ph_cali.offset;
-                    if (isfinite(calibrated) &&
-                        calibrated >= PH_VALUE_MIN &&
-                        calibrated <= PH_VALUE_MAX) {
+                    if (isfinite(calibrated)) {
+                        if (calibrated < PH_VALUE_MIN) calibrated = PH_VALUE_MIN;
+                        if (calibrated > PH_VALUE_MAX) calibrated = PH_VALUE_MAX;
                         ph_reading.value = calibrated;
                         ph_reading.valid = true;
                     }
@@ -1707,9 +1715,9 @@ esp_err_t sensor_telemetry_sample(void)
 
             if (tds_cali.valid) {
                 float tds_computed = tds_cali.slope * tds_comp_raw + tds_cali.offset;
-                if (isfinite(tds_computed) &&
-                    tds_computed >= TDS_VALUE_MIN &&
-                    tds_computed <= TDS_VALUE_MAX) {
+                if (isfinite(tds_computed)) {
+                    if (tds_computed < TDS_VALUE_MIN) tds_computed = TDS_VALUE_MIN;
+                    if (tds_computed > TDS_VALUE_MAX) tds_computed = TDS_VALUE_MAX;
                     tds_reading.value = tds_computed;
                     tds_reading.valid = true;
                 }
@@ -1769,6 +1777,15 @@ esp_err_t sensor_telemetry_sample(void)
     s_snapshot.humidity        = humidity;
     s_snapshot.humidity_valid  = env_valid;
 
+    if (env_valid) {
+        float svp = 0.61078f * expf((17.27f * room_temp) / (room_temp + 237.3f));
+        float avp = svp * (humidity / 100.0f);
+        s_snapshot.vpd = svp - avp;
+        s_snapshot.vpd_valid = true;
+    } else {
+        s_snapshot.vpd_valid = false;
+    }
+
     /* Raw counts for pH/TDS are ADS1115 16-bit counts (0–32767).
      * Water-temp is read via DS18B20 1-Wire and has no raw count. */
     s_snapshot.ph_raw   = ph_reading.raw;
@@ -1793,6 +1810,7 @@ const char *sensor_telemetry_topic_water_level(void) { return s_topics.water_lev
 const char *sensor_telemetry_topic_water_temp(void)  { return s_topics.water_temp_state;  }
 const char *sensor_telemetry_topic_room_temp(void)   { return s_topics.room_temp_state;   }
 const char *sensor_telemetry_topic_humidity(void)    { return s_topics.humidity_state;    }
+const char *sensor_telemetry_topic_vpd(void)         { return s_topics.vpd_state;         }
 const char *sensor_telemetry_topic_ph(void)          { return s_topics.ph_state;           }
 const char *sensor_telemetry_topic_tds(void)         { return s_topics.tds_state;          }
 const char *sensor_telemetry_topic_ph_raw(void)      { return s_topics.ph_raw;             }
