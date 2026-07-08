@@ -14,7 +14,7 @@
 #define ENABLE_WATER_LEVEL      1
 #define ENABLE_ACTUATORS        1
 #define ENABLE_INDICATOR_LEDS   1
-#define ENABLE_SHT31            0
+#define ENABLE_SHT31            1
 #define ENABLE_SETUP_BUTTON     0
 
 /* Actuator output pins */
