@@ -48,7 +48,7 @@
 
 void setup_button_init(void)
 {
-if (s_setup_cfg.enable_setup_button) { // REPLACED_MACRO
+#if ENABLE_SETUP_BUTTON
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << PIN_SETUP_BUTTON),
         .mode         = GPIO_MODE_INPUT,
@@ -60,7 +60,7 @@ if (s_setup_cfg.enable_setup_button) { // REPLACED_MACRO
     ESP_LOGI(TAG, "Setup button initialised on GPIO%d", PIN_SETUP_BUTTON);
 #else
     ESP_LOGI(TAG, "Setup button disabled via pin_config.h");
-} // END REPLACED_MACRO
+#endif
 }
 
 /* -------------------------------------------------------------------------- */
@@ -80,10 +80,10 @@ void setup_button_wait_for_hold(uint32_t hold_ms)
     int      led_state     = 0;
 
     /* Ensure fault LED starts LOW */
-if (s_setup_cfg.enable_indicator_leds) { // REPLACED_MACRO
+#if ENABLE_INDICATOR_LEDS
     gpio_set_direction(PIN_LED_FAULT, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_LED_FAULT, 0);
-} // END REPLACED_MACRO
+#endif
 
     while (held_ticks < hold_ms) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
@@ -93,9 +93,9 @@ if (s_setup_cfg.enable_indicator_leds) { // REPLACED_MACRO
         if (blink_ticks >= BLINK_HALF_MS) {
             blink_ticks = 0;
             led_state   = !led_state;
-if (s_setup_cfg.enable_indicator_leds) { // REPLACED_MACRO
+#if ENABLE_INDICATOR_LEDS
             gpio_set_level(PIN_LED_FAULT, led_state);
-} // END REPLACED_MACRO
+#endif
         }
 
         /* Debounce + hold logic:
@@ -117,9 +117,9 @@ if (s_setup_cfg.enable_indicator_leds) { // REPLACED_MACRO
     }
 
     /* Turn LED off when done */
-if (s_setup_cfg.enable_indicator_leds) { // REPLACED_MACRO
+#if ENABLE_INDICATOR_LEDS
     gpio_set_level(PIN_LED_FAULT, 0);
-} // END REPLACED_MACRO
+#endif
     ESP_LOGI(TAG, "Setup button hold detected — entering setup mode");
 }
 
@@ -179,7 +179,7 @@ static void button_monitor_task(void *arg)
 
 void setup_button_start_monitor(void)
 {
-if (s_setup_cfg.enable_setup_button) { // REPLACED_MACRO
+#if ENABLE_SETUP_BUTTON
     BaseType_t ret = xTaskCreate(
         button_monitor_task,
         "setup_btn_mon",
@@ -193,5 +193,5 @@ if (s_setup_cfg.enable_setup_button) { // REPLACED_MACRO
     } else {
         ESP_LOGI(TAG, "Button monitor task started");
     }
-} // END REPLACED_MACRO
+#endif
 }

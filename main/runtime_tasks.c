@@ -324,9 +324,9 @@ static void runtime_tasks_on_mqtt_connection(bool connected, void *user_ctx)
     }
 
     publish_current_version(zone_id_snap);
-if (s_setup_cfg.enable_actuators) { // REPLACED_MACRO
+#if ENABLE_ACTUATORS
     publish_actuator_states();
-} // END REPLACED_MACRO
+#endif
 }
 
 typedef struct {
@@ -803,7 +803,7 @@ static void dosing_task(void *arg)
                 continue;
             }
 
-if (s_setup_cfg.enable_lcd) { // REPLACED_MACRO
+#if ENABLE_LCD
             /* Post LCD event immediately after execution only if state changed
              * or if it's a PULSE command (which we always show because it finishes quickly). */
             bool new_state = (cmd.action == ACTUATOR_ACTION_ON || cmd.action == ACTUATOR_ACTION_PULSE);
@@ -835,7 +835,7 @@ if (s_setup_cfg.enable_lcd) { // REPLACED_MACRO
                  * (a burst of 8+ commands is rare; the display can't keep up anyway). */
                 xQueueSend(s_lcd_event_queue, &ev, 0);
             }
-} // END REPLACED_MACRO
+#endif
 
             runtime_safety_dose_watchdog_update(cmd.channel, cmd.action, cmd.pulse_ms);
 
@@ -921,7 +921,7 @@ static void comm_task_publish_sensors(const sensor_telemetry_snapshot_t *snap,
     vTaskDelay(pdMS_TO_TICKS(10));
 
     /* ── Environment (SHT31) ──────────────────────────────────────────── */
-if (s_setup_cfg.enable_sht31) { // REPLACED_MACRO
+#if ENABLE_SHT31
     if (snap->room_temp_valid) {
         snprintf(buf, sizeof(buf), "%.2f", (double)snap->room_temp);
         mqtt_manager_publish(sensor_telemetry_topic_room_temp(), buf, 0, 0);
@@ -937,7 +937,7 @@ if (s_setup_cfg.enable_sht31) { // REPLACED_MACRO
         mqtt_manager_publish(sensor_telemetry_topic_vpd(), buf, 0, 0);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-} // END REPLACED_MACRO
+#endif
 
     /* ── pH  raw / state / valid ──────────────────────────────────────── */
     snprintf(buf, sizeof(buf), "%u", (unsigned)snap->ph_raw);
@@ -1022,7 +1022,7 @@ static void comm_task(void *arg)
             comm_task_publish_sensors(&snap, s_zone_id);
         }
 
-if (s_setup_cfg.enable_actuators && s_setup_cfg.enable_lcd) { // REPLACED_MACRO
+#if ENABLE_ACTUATORS && ENABLE_LCD
         /* Drain the LCD event queue — render every event posted by the dosing
          * task since the last comm cycle.  Non-blocking peek so the comm loop
          * never stalls. */
@@ -1056,7 +1056,7 @@ if (s_setup_cfg.enable_actuators && s_setup_cfg.enable_lcd) { // REPLACED_MACRO
                     ev.state_text);
             }
         }
-} // END REPLACED_MACRO /* ENABLE_ACTUATORS && ENABLE_LCD */
+#endif /* ENABLE_ACTUATORS && ENABLE_LCD */
 
         runtime_safety_heartbeat_comm();
         runtime_safety_wdt_kick();
@@ -1156,12 +1156,12 @@ static void cleanup_runtime_locked(void)
         s_dosing_queue = NULL;
     }
 
-if (s_setup_cfg.enable_lcd) { // REPLACED_MACRO
+#if ENABLE_LCD
     if (s_lcd_event_queue != NULL) {
         vQueueDelete(s_lcd_event_queue);
         s_lcd_event_queue = NULL;
     }
-} // END REPLACED_MACRO
+#endif
 
     if (s_snapshot_mutex != NULL) {
         vSemaphoreDelete(s_snapshot_mutex);
@@ -1171,9 +1171,9 @@ if (s_setup_cfg.enable_lcd) { // REPLACED_MACRO
     runtime_safety_bind(NULL);
 
     sensor_telemetry_deinit();
-if (s_setup_cfg.enable_actuators) { // REPLACED_MACRO
+#if ENABLE_ACTUATORS
     actuator_control_deinit();
-} // END REPLACED_MACRO
+#endif
     clear_subscription_tracking();
     s_zone_id[0] = '\0';
     s_zone_name[0] = '\0';
@@ -1301,7 +1301,7 @@ static esp_err_t runtime_setup_resources(const char *zone_id)
 {
     esp_err_t ret = ESP_OK;
 
-if (s_setup_cfg.enable_indicator_leds) { // REPLACED_MACRO
+#if ENABLE_INDICATOR_LEDS
     ret = indicator_led_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "indicator_led_init failed: %s", esp_err_to_name(ret));
@@ -1310,14 +1310,14 @@ if (s_setup_cfg.enable_indicator_leds) { // REPLACED_MACRO
         /* Ring buzzer twice to indicate successful startup */
         indicator_led_startup_beep();
     }
-} // END REPLACED_MACRO
+#endif
 
-if (s_setup_cfg.enable_actuators) { // REPLACED_MACRO
+#if ENABLE_ACTUATORS
     ret = actuator_control_init(zone_id);
     if (ret != ESP_OK) {
         return ret;
     }
-} // END REPLACED_MACRO
+#endif
     ret = sensor_telemetry_init(zone_id);
     if (ret != ESP_OK) {
         return ret;
@@ -1330,14 +1330,14 @@ if (s_setup_cfg.enable_actuators) { // REPLACED_MACRO
         return ESP_ERR_NO_MEM;
     }
 
-if (s_setup_cfg.enable_lcd) { // REPLACED_MACRO
+#if ENABLE_LCD
     if (s_lcd_event_queue == NULL) {
         s_lcd_event_queue = xQueueCreate(LCD_EVENT_QUEUE_LEN, sizeof(lcd_actuator_event_t));
         if (s_lcd_event_queue == NULL) {
             return ESP_ERR_NO_MEM;
         }
     }
-} // END REPLACED_MACRO
+#endif
 
     if (s_snapshot_mutex == NULL) {
         s_snapshot_mutex = xSemaphoreCreateMutex();
@@ -1549,9 +1549,9 @@ esp_err_t runtime_tasks_start(const char *zone_id)
     s_starting = false;
     portEXIT_CRITICAL(&s_zone_id_lock);
     atomic_store(&s_stop_requested, false);
-if (s_setup_cfg.enable_lcd) { // REPLACED_MACRO
+#if ENABLE_LCD
     lcd_status_show_zone_overview(s_zone_id, s_zone_name, "None");
-} // END REPLACED_MACRO
+#endif
     ESP_LOGI(TAG, "Runtime tasks started: DosingTask(%d), SensorTask(%d), CommTask(%d), SafetyTask(%d)",
              DOSING_TASK_PRIORITY, SENSOR_TASK_PRIORITY, COMM_TASK_PRIORITY, SAFETY_TASK_PRIORITY);
     runtime_unlock();
