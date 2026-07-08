@@ -309,7 +309,7 @@ void lcd_status_show_actuator_event(const char *zone_id, const char *zone_name, 
 #define SCROLL_REASON_MAX   256
 #define SCROLL_STEP_MS      300
 #define SCROLL_GAP          4
-#define SCROLL_TASK_STACK   2048
+#define SCROLL_TASK_STACK   4096
 #define SCROLL_TASK_PRIO    1
 
 static TaskHandle_t s_scroll_task   = NULL;
