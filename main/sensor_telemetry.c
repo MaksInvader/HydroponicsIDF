@@ -45,9 +45,9 @@
 #include "sensor_calibration_nvs.h"
 #include "sensor_telemetry.h"
 #include "i2c_bus.h"
-#if ENABLE_SHT31
+if (s_setup_cfg.enable_sht31) { // REPLACED_MACRO
 #include "sht31.h"
-#endif
+} // END REPLACED_MACRO
 
 #if (PH_SOURCE_USE_SERIAL == 1)
 #include "ph_serial.h"
@@ -899,7 +899,7 @@ static esp_err_t ensure_sensor_interfaces(void)
         }
     #endif
 
-    #if ENABLE_WATER_TEMP
+    if (s_setup_cfg.enable_water_temp) { // REPLACED_MACRO
     /* DS18B20 1-Wire (water temperature) */
     ow_init();
 
@@ -912,7 +912,7 @@ static esp_err_t ensure_sensor_interfaces(void)
     /* Trigger the first conversion immediately so the very first
      * sample_water_temp() call one cycle later has a result ready. */
     ow_trigger_conversion();
-    #endif
+    } // END REPLACED_MACRO
 
     return ESP_OK;
 }
@@ -1522,9 +1522,9 @@ esp_err_t sensor_telemetry_init(const char *zone_id)
     }
 
     s_initialized = true;
-    #if ENABLE_WATER_LEVEL
+    if (s_setup_cfg.enable_water_level) { // REPLACED_MACRO
     wl_debounce_init();
-    #endif
+    } // END REPLACED_MACRO
     ESP_LOGI(TAG, "Sensor telemetry initialized for zone: %s", zone_id);
     return ESP_OK;
 }
@@ -1538,9 +1538,9 @@ esp_err_t sensor_telemetry_deinit(void)
     #if (ENABLE_TDS_SENSOR || (PH_SOURCE_USE_SERIAL == 2))
     ads1115_deinit();
     #endif
-    #if ENABLE_WATER_TEMP
+    if (s_setup_cfg.enable_water_temp) { // REPLACED_MACRO
     ow_deinit();
-    #endif
+    } // END REPLACED_MACRO
 
     #if (PH_SOURCE_USE_SERIAL == 1)
         ph_serial_deinit();
@@ -1558,9 +1558,9 @@ esp_err_t sensor_telemetry_deinit(void)
     memset(&s_topics, 0, sizeof(s_topics));
 
     s_initialized = false;
-    #if ENABLE_WATER_LEVEL
+    if (s_setup_cfg.enable_water_level) { // REPLACED_MACRO
     wl_debounce_deinit();
-    #endif
+    } // END REPLACED_MACRO
     ESP_LOGI(TAG, "Sensor telemetry deinitialized");
     return ESP_OK;
 }
@@ -1584,14 +1584,14 @@ esp_err_t sensor_telemetry_sample(void)
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
     /* ── Water level (digital) ─────────────────────────────────────────── */
-    #if ENABLE_WATER_LEVEL
+    if (s_setup_cfg.enable_water_level) { // REPLACED_MACRO
     int water_level = wl_debounce_filter(gpio_get_level((gpio_num_t)PIN_SENSOR_WATER_LEVEL));
     #else
     int water_level = 0;
-    #endif
+    } // END REPLACED_MACRO
 
     /* ── Water temperature (DS18B20 1-Wire, trigger-then-read pattern) ── */
-    #if ENABLE_WATER_TEMP
+    if (s_setup_cfg.enable_water_temp) { // REPLACED_MACRO
     /* Read the result of the conversion triggered at the end of the         */
     /* previous cycle, then immediately trigger the next conversion so it    */
     /* is ready by the time this function is called again (~1000 ms later).  */
@@ -1624,7 +1624,7 @@ esp_err_t sensor_telemetry_sample(void)
     #else
     float temp_c = 0.0f;
     bool temp_valid = false;
-    #endif
+    } // END REPLACED_MACRO
 
     /* Track raw read success independently of calibration validity.
      * These flags gate snap.valid so /raw topics publish even when
@@ -1688,7 +1688,7 @@ esp_err_t sensor_telemetry_sample(void)
     /* ── TDS ───────────────────────────────────────────────────────────── */
     sensor_reading_t tds_reading = {0};
 
-    #if ENABLE_TDS_SENSOR
+    if (s_setup_cfg.enable_tds_sensor) { // REPLACED_MACRO
     {
         int tds_raw = 0;
         /* Median filter temporarily disabled for trial — single sample. */
@@ -1724,16 +1724,16 @@ esp_err_t sensor_telemetry_sample(void)
             }
         }
     }
-    #endif
+    } // END REPLACED_MACRO
 
     /* ── Environment (SHT31) ───────────────────────────────────────────── */
     float room_temp = 0.0f;
     float humidity = 0.0f;
-#if ENABLE_SHT31
+if (s_setup_cfg.enable_sht31) { // REPLACED_MACRO
     bool  env_valid = (sht31_read_temp_and_humidity(&room_temp, &humidity) == ESP_OK);
 #else
     bool  env_valid = false;
-#endif
+} // END REPLACED_MACRO
 
     /* ── Update rolling history & snapshot ────────────────────────────── */
     portENTER_CRITICAL(&s_snapshot_lock);
@@ -1764,13 +1764,13 @@ esp_err_t sensor_telemetry_sample(void)
     s_snapshot.valid = temp_raw_ok || ph_raw_ok || tds_raw_ok || env_valid;
     s_snapshot.water_level          = water_level ? 1 : 0;
     s_snapshot.water_temp           = average_window(s_temp_history, s_temp_history_count);
-#if ENABLE_WATER_TEMP
+if (s_setup_cfg.enable_water_temp) { // REPLACED_MACRO
     s_snapshot.water_temp_sensor_ok = s_temp_read_fresh;  /* only true when last read was valid */
     s_snapshot.water_temp_sensor_dead = (s_temp_fail_count >= SENSOR_TEMP_FAIL_THRESHOLD);
 #else
     s_snapshot.water_temp_sensor_ok = false;   /* sensor disabled — suppress safety checks */
     s_snapshot.water_temp_sensor_dead = false;
-#endif
+} // END REPLACED_MACRO
 
     s_snapshot.room_temp       = room_temp;
     s_snapshot.room_temp_valid = env_valid;

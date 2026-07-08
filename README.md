@@ -38,7 +38,13 @@ This README explains the codebase logic, FreeRTOS usage, safety rules, tasks, an
 - main/runtime_tasks.c/h
   - Orchestrates FreeRTOS tasks (dosing, sensor, comm, safety).
   - Handles MQTT topic subscriptions for commands, safety, OTA.
-  - Applies safety rules, safe-mode gating, watchdogs.
+
+- main/runtime_safety.c/h
+  - Encapsulates all safety subsystem logic (faults, safe mode, watchdogs, heartbeats).
+  - Enforces dose timeouts, sensor out-of-range limits, and interlocks.
+
+- main/sensor_calibration_nvs.c/h
+  - Dynamically calculates, validates, and stores linear calibration coefficients (slope/offset) into NVS based on MQTT payloads.
 
 - main/actuator_control.c/h
   - GPIO control for actuators.
@@ -105,7 +111,7 @@ Watchdog usage:
 
 ## Safety rules and safe mode
 
-Safety rules are implemented in runtime_tasks.c and parameters are in safety_config.h.
+Safety rules are fully encapsulated in `runtime_safety.c` and parameters are in `safety_config.h`.
 
 Major rule categories:
 
@@ -116,6 +122,42 @@ Major rule categories:
 - Dosing limits: per-channel max dose over a rolling time window.
 - pH interlock: prevents simultaneous pH Up and pH Down dosing.
 - Fill timeout: if valve is ON and water level remains low beyond a threshold.
+
+### Safety Faults (`safety_fault_t`)
+
+| Fault Name | Bitmask | Description |
+|---|---|---|
+| `SAFETY_FAULT_DOSE_A` | `0x0001` | Nutrient A pump exceeded max continuous dose time |
+| `SAFETY_FAULT_DOSE_B` | `0x0002` | Nutrient B pump exceeded max continuous dose time |
+| `SAFETY_FAULT_PH_UP` | `0x0004` | pH Up pump exceeded max continuous dose time or pH rate of change too high |
+| `SAFETY_FAULT_PH_DOWN` | `0x0008` | pH Down pump exceeded max continuous dose time or pH rate of change too high |
+| `SAFETY_FAULT_PH_INTERLOCK` | `0x0010` | Attempted to run pH Up and pH Down simultaneously (chemical hazard) |
+| `SAFETY_FAULT_VALVE` | `0x0020` | Main water valve left open beyond the safe fill timeout |
+| `SAFETY_FAULT_GROWLIGHT` | `0x0040` | Growlight control fault |
+| `SAFETY_FAULT_TDS_SENSOR` | `0x0080` | TDS reading out of bounds, frozen, or dose response timeout |
+| `SAFETY_FAULT_PH_SENSOR` | `0x0100` | pH reading out of bounds, frozen, or dose response timeout |
+| `SAFETY_FAULT_I2C_BUS` | `0x0200` | I2C communication failures (e.g. ADC/LCD dropped) |
+| `SAFETY_FAULT_WATER_TEMP` | `0x0400` | Water temperature out of bounds continuously for >1 min |
+| `SAFETY_FAULT_POWER` | `0x0800` | Undervoltage or power supply issues |
+| `SAFETY_FAULT_WDT` | `0x1000` | Task watchdog triggered (Dosing, Sensor, Comm, or Safety stalled) |
+
+### Key Safety Parameters (`safety_config.h`)
+
+| Parameter | Value | Description |
+|---|---|---|
+| `SAFETY_MAX_DOSE_A_MS` | 120,000 ms (2 min) | Max continuous dose for Nutrient A |
+| `SAFETY_MAX_DOSE_B_MS` | 120,000 ms (2 min) | Max continuous dose for Nutrient B |
+| `SAFETY_MAX_DOSE_PH_UP_MS` | 60,000 ms (1 min) | Max continuous dose for pH Up |
+| `SAFETY_MAX_DOSE_PH_DOWN_MS` | 60,000 ms (1 min) | Max continuous dose for pH Down |
+| `SAFETY_FILL_TIMEOUT_MS` | 600,000 ms (10 min) | Max time valve can remain open if tank not full |
+| `SAFETY_TEMP_LOW` | 10.0 °C | Minimum safe water temperature |
+| `SAFETY_TEMP_HIGH` | 36.0 °C | Maximum safe water temperature |
+| `SAFETY_PH_MIN` / `MAX` | 4.5 - 8.5 | Normal operating pH bounds |
+| `SAFETY_PH_CRITICAL_LOW` / `HIGH` | 4.0 - 9.0 | Critical pH bounds (immediate fault) |
+| `SAFETY_PH_RATE_MAX_PER_MIN` | 1.0 / min | Max allowed pH rate of change |
+| `SAFETY_PH_RESPONSE_TIMEOUT_MS` | 90,000 ms (1.5 min) | Max time to wait for pH change after dosing |
+| `SAFETY_TDS_MIN` / `MAX` | 50.0 - 2500.0 | Normal operating TDS bounds |
+| `SAFETY_TDS_RESPONSE_TIMEOUT_MS` | 120,000 ms (2 min) | Max time to wait for TDS change after dosing |
 
 When a safety fault is raised:
 
@@ -164,13 +206,20 @@ flowchart TD
   HttpOTA --> Reboot[Set boot partition + reboot]
 ```
 
-Setup and autostart:
+## Boot Sequence
 
-1. AP + portal start.
-2. User submits SSID, password, broker IP/port, optional zone reassignment.
-3. Device connects STA, connects MQTT, publishes SetUp JSON.
-4. Waits for <zone_id>/success, then starts runtime tasks.
-5. Saves setup config and zone config to NVS.
+The `app_main` entry point follows a strict boot sequence designed for physical safety and headless recovery:
+
+1. **Early GPIO Locking**: Before the RTOS scheduler fully engages, all actuator GPIO pins are forced `LOW` to prevent floating pins from causing relay chatter or accidentally triggering pumps.
+2. **NVS Initialization**: The Non-Volatile Storage is initialized. If corrupted, it automatically erases and formats.
+3. **Boot Fault Recording**: Evaluates the system reset reason (e.g., Brownout, Task Watchdog). If a crash occurred, the reason is recorded as a fault to be published to MQTT once connected.
+4. **Autostart Evaluation**:
+   - The system attempts to load saved WiFi and MQTT credentials from NVS.
+   - **If Success**: The device connects to WiFi and MQTT, publishes `SetUp` JSON, waits for `<zone_id>/success`, launches all RTOS runtime tasks, and begins headless operation immediately. The setup Access Point is never turned on. A background task monitors the physical setup button so the user can reconfigure the device later.
+   - **Handling Outages (The `wifi_tries` counter)**: If the device successfully connects to WiFi but cannot reach the MQTT server (e.g., following a power outage where the router boots faster than the server), it increments an internal `wifi_tries` counter and triggers a full hardware reboot. It will stubbornly attempt this sequence up to **5 times**. Only after the 5th consecutive failure will it abandon autostart.
+   - **If Failure**: (e.g., first boot, bad credentials, or 5 consecutive connection failures), the system drops into a wait state.
+5. **Manual Configuration Mode**: If autostart failed, the device waits for the user to hold the physical setup button for 3 seconds. Once held, it broadcasts a WiFi Access Point (`ESP32S3-Updater`), updates the LCD to display the configuration IP (`192.168.4.1`), and spins up the HTTP web portal.
+6. **Portal Save**: The user submits new credentials via the portal, which are saved to NVS. The device then reboots to begin the standard Autostart sequence.
 
 Runtime:
 
@@ -186,52 +235,85 @@ OTA:
 - ota_update_http_start downloads the bin and writes OTA partition.
 - On success, boot partition is switched and device restarts.
 
-## MQTT topics and payloads
+## MQTT Topics and Payloads
 
-SetUp handshake:
+### Setup & Handshake
+- **Topic**: `SetUp` (Publish)
+  - **Format**: JSON
+  - **Payload**: `{"zone_id": "string", "name": "string"}`
+- **Topic**: `<zone_id>/success` (Subscribe)
+  - **Format**: Any
+  - **Payload**: *Ignored (Receipt indicates broker is ready)*
 
-- Publish: SetUp
-  - Payload JSON: {"zone_id":"<id>","name":"<name>"}
-- Subscribe: <zone_id>/success
-  - Any message indicates success
+### Actuator Control
+- **Topic**: `<zone_id>/<actuator_name>/command` (Subscribe)
+  - **Format**: Plain Text
+  - **Payload**: `ON` | `OFF` | `PULSE:<integer_ms>`
+- **Topic**: `<zone_id>/command` (Subscribe)
+  - **Format**: Plain Text
+  - **Payload**: `"<actuator_name> ON|OFF|PULSE <integer_ms>"`
+- **Topic**: `<zone_id>/<actuator_name>/status` (Publish, Retained)
+  - **Format**: Plain Text
+  - **Payload**: `ON` | `OFF`
 
-Actuator commands:
+### Telemetry (Publish, Retained)
+- **Topic**: `<zone_id>/sensor/WaterLevel/state`
+  - **Format**: Integer (Plain text)
+  - **Payload**: `1` (Full) or `0` (Low)
+- **Topic**: `<zone_id>/sensor/WaterTemp/state`
+  - **Format**: Float (Plain text)
+  - **Payload**: e.g., `24.5` (°C)
+- **Topic**: `<zone_id>/sensor/RoomTemperature/state`
+  - **Format**: Float (Plain text)
+  - **Payload**: e.g., `22.1` (°C)
+- **Topic**: `<zone_id>/sensor/Humidity/state`
+  - **Format**: Float (Plain text)
+  - **Payload**: e.g., `55.0` (%)
+- **Topic**: `<zone_id>/VPD`
+  - **Format**: Float (Plain text)
+  - **Payload**: e.g., `1.2` (kPa)
+- **Topic**: `<zone_id>/sensor/<pH|TDS>/raw`
+  - **Format**: Integer (Plain text)
+  - **Payload**: e.g., `14250` (Raw ADC count)
+- **Topic**: `<zone_id>/sensor/<pH|TDS>/state`
+  - **Format**: Float (Plain text)
+  - **Payload**: e.g., `6.0` (pH) or `800.0` (ppm)
+- **Topic**: `<zone_id>/sensor/<pH|TDS>/valid`
+  - **Format**: Boolean (Plain text)
+  - **Payload**: `"true"` or `"false"`
 
-- <zone_id>/<actuator>/command
-  - Payload: ON | OFF | PULSE:<ms>
-- <zone_id>/command (zone command)
-  - Payload: "<ActuatorName> ON|OFF|PULSE <ms>"
+### Calibration
+- **Topic**: `<zone_id>/calibration/<pH|TDS>/set` (Subscribe)
+  - **Format**: JSON
+  - **Payload**: `{"actual_1": <float>, "raw_1": <float>, "actual_2": <float>, "raw_2": <float>}`
+- **Topic**: `<zone_id>/calibration/<pH|TDS>/state` (Publish, Retained)
+  - **Format**: JSON
+  - **Payload**: `{"mode": "linear", "slope": <float>, "offset": <float>, "valid": <boolean>, "updated_at": <integer_epoch>}`
 
-Actuator status:
+### Safety & Overrides
+- **Topic**: `<zone_id>/safety/fault` (Publish, Retained)
+  - **Format**: JSON
+  - **Payload**: `{"mask": <integer>, "code": "string", "count": <integer>, "text": "string"}`
+- **Topic**: `<zone_id>/safety/clear` (Subscribe)
+  - **Format**: Plain Text
+  - **Payload**: `CLEAR` | `ALL` | `MASK:<hex_string>`
+- **Topic**: `<zone_id>/emergency` (Subscribe)
+  - **Format**: Integer (Plain text)
+  - **Payload**: `1` (Immediately triggers Safe Mode)
+- **Topic**: `<zone_id>/override` (Subscribe)
+  - **Format**: Plain Text
+  - **Payload**: `ON` | `OFF` (Suppresses software safety limits)
 
-- <zone_id>/<actuator>/status
-  - Payload: ON | OFF
-
-Telemetry:
-
-- <zone_id>/sensor/WaterLevel/state -> integer (0 or 1)
-- <zone_id>/sensor/WaterTemp/state -> float
-- <zone_id>/sensor/pH/state -> float
-- <zone_id>/sensor/TDS/state -> float
-
-Safety:
-
-- <zone_id>/safety/fault
-  - Payload JSON: {"mask":<num>,"code":"F-xxx","count":<n>,"text":"<desc>"}
-- <zone_id>/safety/clear
-  - Payload: CLEAR | ALL | MASK:<hex>
-
-OTA:
-
-- <zone_id>/ota/latest_version
-  - Payload: version string
-- <zone_id>/ota/trigger
-  - Payload: 1 (any other value is ignored)
-
-Version:
-
-- <zone_id>/version
-  - Payload: app version, retained
+### OTA & System
+- **Topic**: `<zone_id>/ota/latest_version` (Subscribe)
+  - **Format**: Plain Text
+  - **Payload**: e.g., `"v1.2.3"` (Version string)
+- **Topic**: `<zone_id>/ota/trigger` (Subscribe)
+  - **Format**: Integer (Plain text)
+  - **Payload**: `1` (Starts OTA download if version differs)
+- **Topic**: `<zone_id>/version` (Publish, Retained)
+  - **Format**: Plain Text
+  - **Payload**: e.g., `"v1.2.2"` (Current running firmware version)
 
 ## Web portal and debug
 
@@ -266,10 +348,12 @@ See main/pin_config.h for GPIO assignments. Key pins:
 - Water temp: ADC channel
 - LCD: I2C on GPIO 15/16 (also used in lcd_status.c)
 
-## Known placeholders and limits
+## Current Implementation Notes
 
-- pH and TDS values are placeholders in sensor_telemetry.c.
-- Temperature conversion is a simple placeholder formula.
+- pH and TDS sensors use active dynamic linear calibration (slope/offset) stored in NVS, configured via MQTT.
+- TDS uses explicit real-time temperature compensation normalized to 25°C.
+- Water level uses a rigorous 5-second software debounce filter to reject electrical and physical noise.
+- The LCD features a dedicated FreeRTOS scroll task to marquee long JSON fault payloads automatically.
 - OTA uses a fixed path and port (default: http://<broker_ip>:8123/local/firmware/lorong_node.bin).
 - MQTT topic matching is exact; wildcards are not used.
 - Long PULSE commands block the DosingTask during the pulse.

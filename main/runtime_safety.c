@@ -115,8 +115,15 @@ static void flush_dosing_queue(const char *reason)
         return;
     }
 
-    UBaseType_t dropped_count = uxQueueMessagesWaiting(queue);
-    if (xQueueReset(queue) == pdTRUE && dropped_count > 0) {
+    UBaseType_t dropped_count = 0;
+    /* Draining queue safely without xQueueReset to prevent Kernel Panic
+     * if dosing_task is currently blocked on xQueueReceive. */
+    char dummy_buffer[128]; // Large enough for dosing_command_t
+    while (xQueueReceive(queue, dummy_buffer, 0) == pdTRUE) {
+        dropped_count++;
+    }
+
+    if (dropped_count > 0) {
         ESP_LOGW(TAG, "Dropped %u dosing command(s): %s",
                  (unsigned)dropped_count,
                  reason != NULL ? reason : "unknown reason");
