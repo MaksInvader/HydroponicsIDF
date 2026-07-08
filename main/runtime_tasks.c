@@ -447,14 +447,21 @@ static bool enqueue_command(const dosing_command_t *cmd, const char *source)
             return false;
         }
         /* Queue full — flush all stale pending commands and immediately enqueue
-         * the latest one so the most recent server order takes priority. */
-        UBaseType_t flushed = uxQueueMessagesWaiting(s_dosing_queue);
-        xQueueReset(s_dosing_queue);
+         * the latest one so the most recent server order takes priority.
+         * Safe drain loop instead of xQueueReset to avoid a Kernel Panic if
+         * dosing_task is simultaneously blocked on xQueueReceive. */
+        UBaseType_t flushed = 0;
+        {
+            char _drain_buf[sizeof(dosing_command_t)];
+            while (xQueueReceive(s_dosing_queue, _drain_buf, 0) == pdTRUE) {
+                flushed++;
+            }
+        }
         ESP_LOGW(TAG, "%s: dosing queue full — cleared %u stale command(s), executing latest",
                  source != NULL ? source : "enqueue", (unsigned)flushed);
         sent = xQueueSend(s_dosing_queue, cmd, 0);
         if (sent != pdTRUE) {
-            ESP_LOGE(TAG, "%s: failed to enqueue after queue reset",
+            ESP_LOGE(TAG, "%s: failed to enqueue after queue drain",
                      source != NULL ? source : "enqueue");
             return false;
         }

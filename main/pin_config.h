@@ -71,7 +71,7 @@
  * Change this value to switch pH source at compile time.
  * TDS (ADS1115 AIN0) is unaffected by this setting.
  * -------------------------------------------------------------------------- */
-#define PH_SOURCE_USE_SERIAL  0
+#define PH_SOURCE_USE_SERIAL  1
 
 #if (PH_SOURCE_USE_SERIAL == 1)
 #  define PIN_PH_SERIAL_UART       UART_NUM_1    // Changed from UART_NUM_0
