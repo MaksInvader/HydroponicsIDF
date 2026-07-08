@@ -281,6 +281,32 @@ esp_err_t actuator_control_apply_state(actuator_channel_t channel, bool is_on)
     return ESP_OK;
 }
 
+/* Drive channel GPIO LOW immediately without any MQTT publish.
+ * Called exclusively from safety_enter_safe_state() which runs inside
+ * safety_task (Priority 4). Calling mqtt_manager_publish() from there
+ * can block if the MQTT stack is busy, stalling the task without kicking
+ * the WDT and causing a spurious device restart.
+ * Actuator status is re-published asynchronously by comm_task on its
+ * next telemetry cycle via publish_actuator_states(). */
+void actuator_control_force_off(actuator_channel_t channel)
+{
+    const actuator_entry_t *actuator = entry_for_channel(channel);
+    if (!s_initialized || actuator == NULL) {
+        return;
+    }
+
+    /* Circulation pump is always HIGH — never drive it LOW */
+    if (channel == ACTUATOR_CHANNEL_CIRCULATION_PUMP) {
+        return;
+    }
+
+    gpio_set_level((gpio_num_t)actuator->gpio, 0);
+
+    portENTER_CRITICAL(&s_state_lock);
+    update_last_command_locked(actuator, channel, false);
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
 esp_err_t actuator_control_apply_pulse(actuator_channel_t channel, uint32_t pulse_ms)
 {
     if (pulse_ms == 0 || pulse_ms > ACTUATOR_MAX_PULSE_MS) {

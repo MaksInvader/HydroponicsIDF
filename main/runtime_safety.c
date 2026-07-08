@@ -174,8 +174,15 @@ static void safety_enter_safe_state(safety_fault_mask_t new_faults)
     return;
 #else
     atomic_store(&s_safety.safe_mode, true);
-    lcd_status_show_emergency();
-    
+
+    /* NOTE: lcd_status_show_emergency() intentionally NOT called here.
+     * It acquires s_lcd_lock (mutex) which may be held by lcd_scroll_task_fn
+     * (Priority 1). Blocking here inside safety_task (Priority 4) causes
+     * priority inversion and can stall the TWDT kick, crashing the device.
+     * The fault screen is shown by safety_publish_faults() -> lcd_status_show_fault()
+     * which runs right after this function returns, still within safety_task
+     * but AFTER the critical actuator-shutdown sequence completes. */
+
     /* Keep reserve binary on indefinitely until reset */
     indicator_led_set_fault(true);
 
@@ -183,8 +190,15 @@ static void safety_enter_safe_state(safety_fault_mask_t new_faults)
     s_gate_open = false;
     portEXIT_CRITICAL(&s_gate_lock);
 
+    /* Drive all actuator GPIOs LOW directly — do NOT call the full
+     * actuator_control_apply_state() here because that also calls
+     * mqtt_manager_publish() synchronously for every channel (9 publishes).
+     * Publishing from inside safety_task while MQTT may be congested can
+     * stall the task for hundreds of ms without kicking the WDT.
+     * State tracking is updated; MQTT status publish happens asynchronously
+     * via the comm_task on the next telemetry cycle. */
     for (int i = 0; i < ACTUATOR_CHANNEL_COUNT; i++) {
-        (void)actuator_control_apply_state((actuator_channel_t)i, false);
+        actuator_control_force_off((actuator_channel_t)i);
         runtime_safety_update_channel_state((actuator_channel_t)i, false);
     }
 

@@ -45,6 +45,7 @@ esp_err_t actuator_control_early_gpio_init(void);
 esp_err_t actuator_control_init(const char *zone_id);
 esp_err_t actuator_control_deinit(void);
 esp_err_t actuator_control_apply_state(actuator_channel_t channel, bool is_on);
+void      actuator_control_force_off(actuator_channel_t channel);
 esp_err_t actuator_control_apply_pulse(actuator_channel_t channel, uint32_t pulse_ms);
 esp_err_t actuator_control_parse_action_payload(const char *payload, int payload_len, actuator_action_t *action, uint32_t *pulse_ms);
 const char *actuator_control_get_command_topic(actuator_channel_t channel);
