@@ -1,385 +1,321 @@
-# Website_UpdaterFreeRTOS (ESP32-S3)
+# 🌿 HydroponicsIDF — Autonomous Commercial Hydroponics Firmware
 
-Firmware for an ESP32-S3 node that is configured via a local Wi-Fi AP + web portal, then joins a target Wi-Fi network, connects to an MQTT broker, publishes sensor telemetry, accepts actuator commands, and can perform HTTP OTA updates triggered by MQTT.
+[![Target](https://img.shields.io/badge/Target-ESP32--S3-blue.svg)](https://www.espressif.com/en/products/socs/esp32-s3)
+[![Framework](https://img.shields.io/badge/Framework-ESP--IDF%20v5.5.3-red.svg)](https://docs.espressif.com/projects/esp-idf/en/release-v5.5/)
+[![RTOS](https://img.shields.io/badge/RTOS-SMP%20FreeRTOS-green.svg)](https://www.freertos.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-This README explains the codebase logic, FreeRTOS usage, safety rules, tasks, and data flow to help you modify the firmware safely.
+**HydroponicsIDF** is a production-grade, safety-critical, FreeRTOS-based control firmware engineered for autonomous commercial hydroponics zones (NFT, Dutch Bucket, and DWC systems). Running on the dual-core **Espressif ESP32-S3** microcontroller (16MB Flash), the firmware continuously regulates water chemistry (pH and EC/TDS), schedules high-voltage environmental appliances, manages reservoir replenishment, guarantees life-support circulation, and streams telemetry via MQTT while offering headless HTTP Over-The-Air (OTA) updates.
 
-## High-level flow
+---
 
-1. Boot initializes NVS and records boot faults.
-2. Device starts a setup AP (soft AP) and HTTP portal.
-3. User submits Wi-Fi + MQTT settings and optional zone reassignment.
-4. Device connects to STA, connects to MQTT, publishes SetUp, and waits for zone success.
-5. Runtime tasks start: sensor sampling, command handling, telemetry publish, safety monitoring.
-6. OTA can be triggered by MQTT; firmware is downloaded over HTTP and installed.
+## 📋 Table of Contents
 
-## Components and responsibilities
+- [System Overview & Key Features](#-system-overview--key-features)
+- [Hardware & Pinout Architecture](#-hardware--pinout-architecture)
+- [FreeRTOS Threading Model](#-freertos-threading-model)
+- [Safety Subsystem & Watchdogs](#-safety-subsystem--watchdogs)
+- [Quick Start: Build, Flash & Monitor](#-quick-start-build-flash--monitor)
+- [First-Time Provisioning & Web Portal](#-first-time-provisioning--web-portal)
+- [MQTT Topic & Command Interface](#-mqtt-topic--command-interface)
+- [Repository File Map](#-repository-file-map)
+- [Documentation Vault & References](#-documentation-vault--references)
 
-- main/main.c
-  - Entry point app_main.
-  - NVS init, boot fault record, AP + portal start, autostart attempt.
+---
 
-- main/wifi_manager.c/h
-  - Initializes esp-netif and Wi-Fi.
-  - Starts AP + STA (APSTA).
-  - Connects STA to target SSID with retry/timeout logic.
-  - Maintains connection state and auto-reconnect.
+## 🌟 System Overview & Key Features
 
-- main/web_portal.c/h
-  - HTTP server with setup form and debug endpoints.
-  - Applies configuration and starts runtime.
-  - Autostart using saved NVS settings.
+```
+                                  ┌────────────────────────┐
+                                  │      MQTT Broker       │
+                                  │   (Home Assistant /    │
+                                  │   Custom Cloud Backend)│
+                                  └───────────▲────────────┘
+                                              │ Wi-Fi (MQTT + HTTP OTA)
+                                              ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                              ESP32-S3 Firmware Topology                                │
+│                                                                                        │
+│  ┌──────────────────────┐   ┌───────────────────────┐   ┌───────────────────────────┐  │
+│  │     Sensors & ADC    │   │  FreeRTOS Super-Core  │   │     Actuators & Relays    │  │
+│  ├──────────────────────┤   ├───────────────────────┤   ├───────────────────────────┤  │
+│  │ • ADS1115 (16-bit)   │──►│ • SafetyTask (Prio 4) │──►│ • Nut A/B Peristaltic     │  │
+│  │ • DS18B20 (1-Wire)   │   │ • DosingTask (Prio 3) │   │ • pH Up/Down Peristaltic  │  │
+│  │ • SHT31 (Temp/RH/VPD)│   │ • SensorTask (Prio 2) │   │ • Fresh Water Solenoid    │  │
+│  │ • pH Sensor (UART1)  │   │ • CommTask   (Prio 1) │   │ • Circulation Pump (Lock) │  │
+│  │ • Water Float Switch │   │ • ScrollTask (Prio 1) │   │ • 4x 10A AC Relays        │  │
+│  └──────────────────────┘   └───────────────────────┘   └───────────────────────────┘  │
+│                                         │                                              │
+│                                         ▼                                              │
+│                        ┌─────────────────────────────────┐                             │
+│                        │       Local HMI Diagnostics     │                             │
+│                        │ • 20x4 I2C Character LCD        │                             │
+│                        │ • Marquee Fault String Display  │                             │
+│                        │ • Connection & Alarm LEDs       │                             │
+│                        └─────────────────────────────────┘                             │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-- main/mqtt_manager.c/h
-  - Initializes and manages MQTT client.
-  - Maintains a subscription registry and dispatches by exact topic match.
-  - Publishes SetUp and waits for zone success.
+- **Deterministic Concurrency**: Preemptive multi-threaded architecture with 4 prioritized FreeRTOS tasks to eliminate jitter and prevent network latency from blocking physical control.
+- **Mutual Exclusion & Chemical Safety**: Hardware-level and software-enforced interlocks prevent mixing concentrated acid (pH Up) and base (pH Down) simultaneously.
+- **Dual-Tier Watchdog Engine**: Hardware ESP-IDF Task Watchdog Timer (TWDT) paired with a software task heartbeat counter prevents undetected task starvation or deadlocks.
+- **Dynamic 2-Point Linear Calibration**: Real-time pH and TDS calibration coefficients computed, validated, and persisted to Non-Volatile Storage (NVS) on-the-fly via MQTT.
+- **Temperature Compensation**: Automatic Nernst/solution temperature normalization to 25°C for TDS and pH measurements using high-accuracy DS18B20 telemetry.
+- **Fail-Safe Boot Clamping**: All relay and pump GPIOs are clamped `LOW` in early boot stages before the scheduler starts to eliminate relay chatter during brownouts or reboots. The circulation pump is locked `HIGH` to protect crop root health.
+- **Zero-Touch Reconnect & Captive Portal**: Seamless headless recovery with exponential backoff on Wi-Fi/MQTT dropouts, backed by an on-demand SoftAP (`192.168.4.1`) captive web portal.
 
-- main/runtime_tasks.c/h
-  - Orchestrates FreeRTOS tasks (dosing, sensor, comm, safety).
-  - Handles MQTT topic subscriptions for commands, safety, OTA.
+---
 
-- main/runtime_safety.c/h
-  - Encapsulates all safety subsystem logic (faults, safe mode, watchdogs, heartbeats).
-  - Enforces dose timeouts, sensor out-of-range limits, and interlocks.
+## 📌 Hardware & Pinout Architecture
 
-- main/sensor_calibration_nvs.c/h
-  - Dynamically calculates, validates, and stores linear calibration coefficients (slope/offset) into NVS based on MQTT payloads.
+The firmware is tailored for the **ESP32-S3** with external I2C, 1-Wire, and UART interfaces:
 
-- main/actuator_control.c/h
-  - GPIO control for actuators.
-  - Parses ON/OFF/PULSE commands.
-  - Publishes actuator status.
+### Actuator & Relay Pinout
+| Pin | Function | Active Level | Electrical Type | Description |
+|:---:|---|:---:|:---:|---|
+| **GPIO 41** | Nutrient A Pump | HIGH | 12V MOSFET / Relay | Peristaltic pump for fertilizer component A |
+| **GPIO 40** | Nutrient B Pump | HIGH | 12V MOSFET / Relay | Peristaltic pump for fertilizer component B |
+| **GPIO 39** | pH Up Pump | HIGH | 12V MOSFET / Relay | Peristaltic pump for alkaline buffer solution |
+| **GPIO 38** | pH Down Pump | HIGH | 12V MOSFET / Relay | Peristaltic pump for phosphoric/nitric acid |
+| **GPIO 12** | Freshwater Solenoid | HIGH | 12V MOSFET / Solenoid | Automatic reservoir water top-off valve |
+| **GPIO 13** | **Circulation Pump** | **HIGH** | AC Relay / Optocoupler | **Life-support line:** Initialized `HIGH` at boot, protected from shutoff |
+| **GPIO 47** | Relay 1 (Growlight) | HIGH | 10A / 250VAC Relay | Lighting schedule / photoperiod control |
+| **GPIO 14** | Relay 2 (Chiller/Heater)| HIGH | 10A / 250VAC Relay | Water temperature conditioning unit |
+| **GPIO 21** | Relay 3 (Bubbler) | HIGH | 10A / 250VAC Relay | Reservoir aeration / oxygenation stone |
+| **GPIO 45** | Relay 4 (Exhaust Fan)| HIGH | 10A / 250VAC Relay | Canopy airflow and humidity evacuation |
 
-- main/sensor_telemetry.c/h
-  - Samples sensors and computes rolling averages.
-  - Builds telemetry topics.
-  - Holds last snapshot for publishing and debug.
+### Sensors, Busses & Diagnostics
+| Pin | Function | Direction | Protocol / Type | Notes |
+|:---:|---|:---:|:---:|---|
+| **GPIO 16** | I2C0 SDA | Bidirectional | I2C (100 kHz) | Bus master for ADS1115 (`0x48`), SHT31 (`0x44`), LCD (`0x27`) |
+| **GPIO 15** | I2C0 SCL | Output | I2C (100 kHz) | Requires external 4.7 kΩ pull-ups to 3.3V |
+| **GPIO 8** | Water Temp | Bidirectional | 1-Wire (RMT) | DS18B20 digital probe (requires 4.7 kΩ pull-up to 3.3V) |
+| **GPIO 5** | Water Level | Input | Digital (Active LOW) | Mechanical float switch with 5-second software debounce filter |
+| **GPIO 17** | pH Serial TX | Output | UART1 (9600 baud) | Dedicated isolated serial pH sensor interface |
+| **GPIO 18** | pH Serial RX | Input | UART1 (9600 baud) | Dedicated isolated serial pH sensor interface |
+| **GPIO 1** | Connection LED | Output | Digital (Active HIGH) | Blue LED: Indicates active Wi-Fi and MQTT connectivity |
+| **GPIO 2** | Fault LED | Output | Digital (Active HIGH) | Red LED: Solid during Safe Mode or critical alarms |
+| **GPIO 46** | Setup Button | Input | Digital (Active LOW) | Hold for 3s to enter SoftAP setup mode |
 
-- main/ota_update.c/h
-  - HTTP OTA download task.
-  - Writes OTA partition and reboots on success.
+---
 
-- main/lcd_status.c/h
-  - I2C LCD status pages for setup and runtime.
+## 🧵 FreeRTOS Threading Model
 
-- main/setup_config.c/h and main/zone_config.c/h
-  - NVS persistence for Wi-Fi/MQTT setup and zone assignment.
-
-- main/safety_config.h and main/pin_config.h
-  - Safety thresholds and hardware pin mappings.
-
-## FreeRTOS usage and threading model
-
-The runtime is built around four FreeRTOS tasks and one queue. All tasks are created in runtime_tasks_start.
-
-Task list:
-
-- SafetyTask (priority 4, period 500 ms)
-  - Enforces safety rules, monitors heartbeats, checks sensors.
-  - Can enter safe mode, which closes the command gate and turns actuators off.
-
-- DosingTask (priority 3)
-  - Consumes a queue of actuator commands.
-  - Executes ON/OFF/PULSE actions, updates dose watchdogs.
-
-- SensorTask (priority 2, period 1000 ms)
-  - Samples sensors and updates rolling averages.
-
-- CommTask (priority 1, period 1000 ms)
-  - Publishes telemetry to MQTT.
-  - Publishes firmware version periodically (30 s).
-  - Updates LCD on actuator events.
-
-Key threading primitives:
-
-- Queue: s_dosing_queue (command queue). Only DosingTask applies actuator actions.
-- Mutexes: runtime mutex, snapshot mutex, LCD mutex, MQTT subscription mutex.
-- Event group: used in MQTT manager and task exit coordination.
-- Atomic flags: safe mode, stop requested, heartbeats, fault masks.
-
-Command gating:
-
-- s_gate_open controls whether commands can be enqueued.
-- Gate closes on safe mode or during stop. Queue enqueue is rejected if gate is closed.
-
-Watchdog usage:
-
-- Safety task initializes task watchdog (configurable timeout in safety_config.h).
-- Each task periodically resets the watchdog and increments a heartbeat counter.
-- Safety task checks heartbeats; if any task stalls, it raises a safety fault.
-
-## Safety rules and safe mode
-
-Safety rules are fully encapsulated in `runtime_safety.c` and parameters are in `safety_config.h`.
-
-Major rule categories:
-
-- Heartbeat watchdog: if any task stops incrementing its heartbeat, a WDT safety fault is raised.
-- Water level: low level detected by GPIO ISR or sensor snapshot triggers fault.
-- Temperature: range checks, critical limits, and frozen sensor detection.
-- pH/TDS: range checks, frozen detection, and response timeouts after dosing.
-- Dosing limits: per-channel max dose over a rolling time window.
-- pH interlock: prevents simultaneous pH Up and pH Down dosing.
-- Fill timeout: if valve is ON and water level remains low beyond a threshold.
-
-### Safety Faults (`safety_fault_t`)
-
-| Fault Name | Bitmask | Description |
-|---|---|---|
-| `SAFETY_FAULT_DOSE_A` | `0x0001` | Nutrient A pump exceeded max continuous dose time |
-| `SAFETY_FAULT_DOSE_B` | `0x0002` | Nutrient B pump exceeded max continuous dose time |
-| `SAFETY_FAULT_PH_UP` | `0x0004` | pH Up pump exceeded max continuous dose time or pH rate of change too high |
-| `SAFETY_FAULT_PH_DOWN` | `0x0008` | pH Down pump exceeded max continuous dose time or pH rate of change too high |
-| `SAFETY_FAULT_PH_INTERLOCK` | `0x0010` | Attempted to run pH Up and pH Down simultaneously (chemical hazard) |
-| `SAFETY_FAULT_VALVE` | `0x0020` | Main water valve left open beyond the safe fill timeout |
-| `SAFETY_FAULT_GROWLIGHT` | `0x0040` | Growlight control fault |
-| `SAFETY_FAULT_TDS_SENSOR` | `0x0080` | TDS reading out of bounds, frozen, or dose response timeout |
-| `SAFETY_FAULT_PH_SENSOR` | `0x0100` | pH reading out of bounds, frozen, or dose response timeout |
-| `SAFETY_FAULT_I2C_BUS` | `0x0200` | I2C communication failures (e.g. ADC/LCD dropped) |
-| `SAFETY_FAULT_WATER_TEMP` | `0x0400` | Water temperature out of bounds continuously for >1 min |
-| `SAFETY_FAULT_POWER` | `0x0800` | Undervoltage or power supply issues |
-| `SAFETY_FAULT_WDT` | `0x1000` | Task watchdog triggered (Dosing, Sensor, Comm, or Safety stalled) |
-
-### Key Safety Parameters (`safety_config.h`)
-
-| Parameter | Value | Description |
-|---|---|---|
-| `SAFETY_MAX_DOSE_A_MS` | 120,000 ms (2 min) | Max continuous dose for Nutrient A |
-| `SAFETY_MAX_DOSE_B_MS` | 120,000 ms (2 min) | Max continuous dose for Nutrient B |
-| `SAFETY_MAX_DOSE_PH_UP_MS` | 60,000 ms (1 min) | Max continuous dose for pH Up |
-| `SAFETY_MAX_DOSE_PH_DOWN_MS` | 60,000 ms (1 min) | Max continuous dose for pH Down |
-| `SAFETY_FILL_TIMEOUT_MS` | 600,000 ms (10 min) | Max time valve can remain open if tank not full |
-| `SAFETY_TEMP_LOW` | 10.0 °C | Minimum safe water temperature |
-| `SAFETY_TEMP_HIGH` | 36.0 °C | Maximum safe water temperature |
-| `SAFETY_PH_MIN` / `MAX` | 4.5 - 8.5 | Normal operating pH bounds |
-| `SAFETY_PH_CRITICAL_LOW` / `HIGH` | 4.0 - 9.0 | Critical pH bounds (immediate fault) |
-| `SAFETY_PH_RATE_MAX_PER_MIN` | 1.0 / min | Max allowed pH rate of change |
-| `SAFETY_PH_RESPONSE_TIMEOUT_MS` | 90,000 ms (1.5 min) | Max time to wait for pH change after dosing |
-| `SAFETY_TDS_MIN` / `MAX` | 50.0 - 2500.0 | Normal operating TDS bounds |
-| `SAFETY_TDS_RESPONSE_TIMEOUT_MS` | 120,000 ms (2 min) | Max time to wait for TDS change after dosing |
-
-When a safety fault is raised:
-
-- Safe mode is entered.
-- All actuators are turned OFF.
-- Command gate is closed (no new commands processed).
-- Fault status is published to MQTT and shown on LCD.
-
-Clearing faults:
-
-- Publish to <zone_id>/safety/clear with payload:
-  - CLEAR or ALL to clear all faults
-  - MASK:<hex> to clear a specific fault mask
-- Clearing all faults exits safe mode and reopens the command gate.
-
-## Data flow overview
-
-## Data flow diagram (Mermaid)
+The firmware allocates dedicated task stacks and priorities to isolate networking latencies from high-precision physical dosing:
 
 ```mermaid
 flowchart TD
-  Boot[Boot + NVS init] --> AP[Start AP + Web Portal]
-  AP -->|POST /configure| WiFi[Connect STA Wi-Fi]
-  WiFi --> MQTT[Connect MQTT]
-  MQTT --> Setup[Publish SetUp + wait zone_id/success]
-  Setup --> RT[Start runtime tasks]
+    subgraph Priorities ["Priority Tier (SMP Dual-Core)"]
+        direction TB
+        P4["Priority 4 (Highest)"]
+        P3["Priority 3"]
+        P2["Priority 2"]
+        P1["Priority 1 (Lowest)"]
+    end
 
-  subgraph Runtime Tasks
-    Sensor[SensorTask] --> Snap[Snapshot cache]
-    Snap --> Comm[CommTask]
-    Comm --> PubTel[Publish telemetry]
+    subgraph Tasks ["Active FreeRTOS Tasks"]
+        Safety["🛡️ SafetyTask (500ms period)\nWatchdog heartbeat checks, dose duration limits, frozen sensor detection"]
+        Dosing["⚙️ DosingTask (Event-Driven)\nConsumes s_dosing_queue, executes ON/OFF/PULSE commands"]
+        Sensor["🌡️ SensorTask (2000ms period)\nSamples ADS1115, DS18B20, SHT31, UART pH; writes snapshot"]
+        Comm["📡 CommTask (3000ms period)\nPublishes telemetry snapshots, zone version, and drains LCD events"]
+        Scroll["📜 ScrollTask (250ms period)\nMarquees diagnostic fault strings across 20x4 character LCD"]
+    end
 
-    CmdTopics[MQTT command topics] --> DQueue[Dosing queue]
-    DQueue --> Dosing[DosingTask]
-    Dosing --> GPIO[Actuator GPIO]
-    Dosing --> StatusPub[Publish actuator status]
-
-    Safety[SafetyTask] --> Gate[Command gate]
-    Safety --> Faults[Publish safety faults]
-    Safety --> LCD[LCD status]
-  end
-
-  MQTT --> CmdTopics
-  MQTT --> OTA[OTA trigger topic]
-  OTA --> HttpOTA[HTTP OTA download]
-  HttpOTA --> Reboot[Set boot partition + reboot]
+    P4 --- Safety
+    P3 --- Dosing
+    P2 --- Sensor
+    P1 --- Comm
+    P1 --- Scroll
 ```
 
-## Boot Sequence
+### IPC & Synchronization Primitives
+- **`s_dosing_queue` (`QueueHandle_t`)**: 64-slot command FIFO protecting actuators against race conditions. Only `DosingTask` toggles physical GPIOs.
+- **`s_snapshot_mutex` (`SemaphoreHandle_t`)**: Mutex protecting the `sensor_telemetry_snapshot_t` buffer during read/write cycles.
+- **Lock-Free Atomics (`<stdatomic.h>`)**: Task heartbeats, safe mode state, and command gate flags (`s_gate_open`) use atomic load/store for lock-free cross-core access without deadlocks.
 
-The `app_main` entry point follows a strict boot sequence designed for physical safety and headless recovery:
+---
 
-1. **Early GPIO Locking**: Before the RTOS scheduler fully engages, all actuator GPIO pins are forced `LOW` to prevent floating pins from causing relay chatter or accidentally triggering pumps.
-2. **NVS Initialization**: The Non-Volatile Storage is initialized. If corrupted, it automatically erases and formats.
-3. **Boot Fault Recording**: Evaluates the system reset reason (e.g., Brownout, Task Watchdog). If a crash occurred, the reason is recorded as a fault to be published to MQTT once connected.
-4. **Autostart Evaluation**:
-   - The system attempts to load saved WiFi and MQTT credentials from NVS.
-   - **If Success**: The device connects to WiFi and MQTT, publishes `SetUp` JSON, waits for `<zone_id>/success`, launches all RTOS runtime tasks, and begins headless operation immediately. The setup Access Point is never turned on. A background task monitors the physical setup button so the user can reconfigure the device later.
-   - **Handling Outages (The `wifi_tries` counter)**: If the device successfully connects to WiFi but cannot reach the MQTT server (e.g., following a power outage where the router boots faster than the server), it increments an internal `wifi_tries` counter and triggers a full hardware reboot. It will stubbornly attempt this sequence up to **5 times**. Only after the 5th consecutive failure will it abandon autostart.
-   - **If Failure**: (e.g., first boot, bad credentials, or 5 consecutive connection failures), the system drops into a wait state.
-5. **Manual Configuration Mode**: If autostart failed, the device waits for the user to hold the physical setup button for 3 seconds. Once held, it broadcasts a WiFi Access Point (`ESP32S3-Updater`), updates the LCD to display the configuration IP (`192.168.4.1`), and spins up the HTTP web portal.
-6. **Portal Save**: The user submits new credentials via the portal, which are saved to NVS. The device then reboots to begin the standard Autostart sequence.
+## 🛡️ Safety Subsystem & Watchdogs
 
-Runtime:
+The firmware runs a deterministic safety engine in [`main/runtime_safety.c`](file:///c:/Users/ASUS/Documents/HydroponicsIDF/main/runtime_safety.c) governed by thresholds in [`main/safety_config.h`](file:///c:/Users/ASUS/Documents/HydroponicsIDF/main/safety_config.h):
 
-- MQTT command topics -> enqueue in dosing queue -> DosingTask applies GPIO -> status publish.
-- SensorTask samples sensors -> snapshot -> CommTask publishes telemetry.
-- SafetyTask monitors snapshots + heartbeats -> may enter safe mode -> faults published.
-- LCD updates when actuator commands change.
+```
+Normal Operation  ──► [Fault Condition Detected] ──► Trigger Safe Mode
+                                                            │
+  ┌─────────────────────────────────────────────────────────┘
+  ▼
+1. Lower command gate (reject inbound MQTT actuator commands)
+2. Force all dosing pumps, valves, and heating elements OFF
+3. Keep Circulation Pump ON (protect biological roots)
+4. Turn ON red Alarm LED (GPIO 2) & broadcast MQTT fault payload
+5. Render active Fault Code (F-001...F-013) on 20x4 LCD
+```
 
-OTA:
+### Safety Fault Directory (`safety_fault_t`)
+| Fault Code | Bitmask | Trigger Condition | Max Permitted Limit |
+|---|:---:|---|---|
+| `SAFETY_FAULT_DOSE_A` | `0x0001` | Nutrient A pump run time exceeded | 120,000 ms (2 min) |
+| `SAFETY_FAULT_DOSE_B` | `0x0002` | Nutrient B pump run time exceeded | 120,000 ms (2 min) |
+| `SAFETY_FAULT_PH_UP` | `0x0004` | pH Up pump run time or rate of change exceeded | 60,000 ms (1 min) |
+| `SAFETY_FAULT_PH_DOWN` | `0x0008` | pH Down pump run time or rate of change exceeded | 60,000 ms (1 min) |
+| `SAFETY_FAULT_PH_INTERLOCK` | `0x0010` | Simultaneous pH Up and pH Down execution detected | Immediate trip |
+| `SAFETY_FAULT_VALVE` | `0x0020` | Refill valve left open without tank reaching FULL | 600,000 ms (10 min) |
+| `SAFETY_FAULT_TDS_SENSOR` | `0x0080` | TDS reading out-of-bounds or frozen across samples | < 50 ppm or > 2500 ppm |
+| `SAFETY_FAULT_PH_SENSOR` | `0x0100` | pH reading out-of-bounds or frozen across samples | < 4.0 pH or > 9.0 pH |
+| `SAFETY_FAULT_I2C_BUS` | `0x0200` | Repeated bus lockup / dropped ACK on I2C0 | > 5 consecutive failures |
+| `SAFETY_FAULT_WATER_TEMP` | `0x0400` | Water temperature out of safe biological range | < 10.0°C or > 36.0°C |
+| `SAFETY_FAULT_WDT` | `0x1000` | FreeRTOS task heartbeat stalled (task hang/deadlock)| 15,000 ms heartbeat timeout |
 
-- MQTT <zone_id>/ota/trigger with payload 1 starts OTA if not already in progress.
-- Firmware URL is built from broker_ip and fixed HTTP path/port.
-- ota_update_http_start downloads the bin and writes OTA partition.
-- On success, boot partition is switched and device restarts.
+Faults can be cleared over MQTT by publishing `CLEAR` or `ALL` to `<zone_id>/safety/clear`.
 
-## MQTT Topics and Payloads
+---
 
-### Setup & Handshake
-- **Topic**: `SetUp` (Publish)
-  - **Format**: JSON
-  - **Payload**: `{"zone_id": "string", "name": "string"}`
-- **Topic**: `<zone_id>/success` (Subscribe)
-  - **Format**: Any
-  - **Payload**: *Ignored (Receipt indicates broker is ready)*
+## 🚀 Quick Start: Build, Flash & Monitor
 
-### Actuator Control
-- **Topic**: `<zone_id>/<actuator_name>/command` (Subscribe)
-  - **Format**: Plain Text
-  - **Payload**: `ON` | `OFF` | `PULSE:<integer_ms>`
-- **Topic**: `<zone_id>/command` (Subscribe)
-  - **Format**: Plain Text
-  - **Payload**: `"<actuator_name> ON|OFF|PULSE <integer_ms>"`
-- **Topic**: `<zone_id>/<actuator_name>/status` (Publish, Retained)
-  - **Format**: Plain Text
-  - **Payload**: `ON` | `OFF`
+### Prerequisites
+1. **ESP-IDF v5.5.x** (v5.5.3 recommended) installed and exported to your shell.
+2. ESP32-S3 board connected via USB (UART port).
 
-### Telemetry (Publish, Retained)
-- **Topic**: `<zone_id>/sensor/WaterLevel/state`
-  - **Format**: Integer (Plain text)
-  - **Payload**: `1` (Full) or `0` (Low)
-- **Topic**: `<zone_id>/sensor/WaterTemp/state`
-  - **Format**: Float (Plain text)
-  - **Payload**: e.g., `24.5` (°C)
-- **Topic**: `<zone_id>/sensor/RoomTemperature/state`
-  - **Format**: Float (Plain text)
-  - **Payload**: e.g., `22.1` (°C)
-- **Topic**: `<zone_id>/sensor/Humidity/state`
-  - **Format**: Float (Plain text)
-  - **Payload**: e.g., `55.0` (%)
-- **Topic**: `<zone_id>/VPD`
-  - **Format**: Float (Plain text)
-  - **Payload**: e.g., `1.2` (kPa)
-- **Topic**: `<zone_id>/sensor/<pH|TDS>/raw`
-  - **Format**: Integer (Plain text)
-  - **Payload**: e.g., `14250` (Raw ADC count)
-- **Topic**: `<zone_id>/sensor/<pH|TDS>/state`
-  - **Format**: Float (Plain text)
-  - **Payload**: e.g., `6.0` (pH) or `800.0` (ppm)
-- **Topic**: `<zone_id>/sensor/<pH|TDS>/valid`
-  - **Format**: Boolean (Plain text)
-  - **Payload**: `"true"` or `"false"`
+### 1. Clone the Repository
+```bash
+git clone https://github.com/YourUsername/HydroponicsIDF.git
+cd HydroponicsIDF
+```
 
-### Calibration
-- **Topic**: `<zone_id>/calibration/<pH|TDS>/set` (Subscribe)
-  - **Format**: JSON
-  - **Payload**: `{"actual_1": <float>, "raw_1": <float>, "actual_2": <float>, "raw_2": <float>}`
-- **Topic**: `<zone_id>/calibration/<pH|TDS>/state` (Publish, Retained)
-  - **Format**: JSON
-  - **Payload**: `{"mode": "linear", "slope": <float>, "offset": <float>, "valid": <boolean>, "updated_at": <integer_epoch>}`
+### 2. Set Target to ESP32-S3
+```bash
+idf.py set-target esp32s3
+```
 
-### Safety & Overrides
-- **Topic**: `<zone_id>/safety/fault` (Publish, Retained)
-  - **Format**: JSON
-  - **Payload**: `{"mask": <integer>, "code": "string", "count": <integer>, "text": "string"}`
-- **Topic**: `<zone_id>/safety/clear` (Subscribe)
-  - **Format**: Plain Text
-  - **Payload**: `CLEAR` | `ALL` | `MASK:<hex_string>`
-- **Topic**: `<zone_id>/emergency` (Subscribe)
-  - **Format**: Integer (Plain text)
-  - **Payload**: `1` (Immediately triggers Safe Mode)
-- **Topic**: `<zone_id>/override` (Subscribe)
-  - **Format**: Plain Text
-  - **Payload**: `ON` | `OFF` (Suppresses software safety limits)
+### 3. Build the Firmware
+```bash
+idf.py build
+```
 
-### OTA & System
-- **Topic**: `<zone_id>/ota/latest_version` (Subscribe)
-  - **Format**: Plain Text
-  - **Payload**: e.g., `"v1.2.3"` (Version string)
-- **Topic**: `<zone_id>/ota/trigger` (Subscribe)
-  - **Format**: Integer (Plain text)
-  - **Payload**: `1` (Starts OTA download if version differs)
-- **Topic**: `<zone_id>/version` (Publish, Retained)
-  - **Format**: Plain Text
-  - **Payload**: e.g., `"v1.2.2"` (Current running firmware version)
+### 4. Flash and Open Serial Monitor
+```bash
+# On Linux/macOS:
+idf.py -p /dev/ttyUSB0 flash monitor
 
-## Web portal and debug
+# On Windows:
+idf.py -p COM3 flash monitor
+```
+*(Press `Ctrl+]` to exit the ESP-IDF monitor).*
 
-Portal endpoints:
+---
 
-- GET /
-  - Setup form for Wi-Fi, broker, and optional zone reassignment.
-- POST /configure
-  - Applies setup, connects, publishes SetUp, starts runtime.
-- GET /debug
-  - HTML debug page.
-- GET /debug/data
-  - JSON with current zone, topic list, last commands, sensor snapshot.
+## 🌐 First-Time Provisioning & Web Portal
 
-## NVS persistence
+1. **Boot into AP Mode**:
+   - On first boot (empty NVS) or if the physical setup button is held for 3 seconds, the device spins up an unencrypted Wi-Fi Access Point:
+     - **SSID:** `ESP32S3-Updater`
+     - **Portal IP:** `http://192.168.4.1`
+2. **Configure Parameters**:
+   - Connect a smartphone or laptop to `ESP32S3-Updater` and open `http://192.168.4.1`.
+   - Fill in target **Wi-Fi SSID**, **Password**, **MQTT Broker IP**, and **Zone ID** (e.g., `zone_1`).
+3. **Autostart Operation**:
+   - The device commits the settings to NVS and reboots into normal runtime.
+   - On subsequent power-ups, the device autostarts headlessly without activating the setup AP.
 
-Namespaces:
+---
 
-- zone_cfg
-  - zone_id, zone_name
-- setup_cfg
-  - ssid, password, broker_ip, broker_port, ota_broker_ip
+## 📡 MQTT Topic & Command Interface
 
-Autostart uses saved zone + setup to connect and start runtime without portal input.
+All topics are dynamically namespaced by `<zone_id>` (configured during provisioning).
 
-## Hardware pin mapping
+### 1. Actuator Commands (Subscribe)
+Topic: `<zone_id>/<channel>/command`  
+Payloads: `ON`, `OFF`, or `PULSE:<duration_ms>`
 
-See main/pin_config.h for GPIO assignments. Key pins:
+| Target Channel | MQTT Topic | Example Payload |
+|---|---|---|
+| Main Refill Valve | `<zone_id>/valve/command` | `ON` or `OFF` |
+| Nutrient Pump A | `<zone_id>/PerNutA/command` | `PULSE:5000` (doses for 5s) |
+| Nutrient Pump B | `<zone_id>/PerNutB/command` | `PULSE:5000` |
+| pH Up Peristaltic | `<zone_id>/PerpHUp/command` | `PULSE:2000` |
+| pH Down Peristaltic | `<zone_id>/PerpHDown/command` | `PULSE:2000` |
+| AC Relay 1 (Growlight)| `<zone_id>/relay1/command` | `ON` |
+| AC Relay 2 (Chiller) | `<zone_id>/relay2/command` | `OFF` |
+| AC Relay 3 (Bubbler) | `<zone_id>/relay3/command` | `ON` |
+| AC Relay 4 (Fan) | `<zone_id>/relay4/command` | `ON` |
 
-- Actuators: valve, PerNutA, PerNutB, PerpHUp, PerpHDown
-- Water level: GPIO input
-- Water temp: ADC channel
-- LCD: I2C on GPIO 15/16 (also used in lcd_status.c)
+### 2. Live Telemetry (Publish, Retained)
+| Topic | Payload Format | Example |
+|---|:---:|---|
+| `<zone_id>/sensor/WaterLevel/state` | `1` (Full) / `0` (Low) | `1` |
+| `<zone_id>/sensor/WaterTemp/state` | Float (°C) | `24.8` |
+| `<zone_id>/sensor/RoomTemperature/state` | Float (°C) | `22.4` |
+| `<zone_id>/sensor/Humidity/state` | Float (% RH) | `61.2` |
+| `<zone_id>/VPD` | Float (kPa) | `1.15` |
+| `<zone_id>/sensor/pH/state` | Float (pH scale) | `6.15` |
+| `<zone_id>/sensor/TDS/state` | Float (ppm) | `850.0` |
+| `<zone_id>/safety/fault` | JSON object | `{"mask":16,"code":"F-005","text":"PH_INTERLOCK"}` |
+| `<zone_id>/version` | Plain text | `v1.2.0` |
 
-## Current Implementation Notes
+### 3. Calibration Payloads
+Publish 2-point reference calibration data to `<zone_id>/calibration/<pH|TDS>/set`:
+```json
+{
+  "actual_1": 4.01,
+  "raw_1": 15200.0,
+  "actual_2": 6.86,
+  "raw_2": 11350.0
+}
+```
 
-- pH and TDS sensors use active dynamic linear calibration (slope/offset) stored in NVS, configured via MQTT.
-- TDS uses explicit real-time temperature compensation normalized to 25°C.
-- Water level uses a rigorous 5-second software debounce filter to reject electrical and physical noise.
-- The LCD features a dedicated FreeRTOS scroll task to marquee long JSON fault payloads automatically.
-- OTA uses a fixed path and port (default: http://<broker_ip>:8123/local/firmware/lorong_node.bin).
-- MQTT topic matching is exact; wildcards are not used.
-- Long PULSE commands block the DosingTask during the pulse.
+---
 
-## Build notes (ESP-IDF)
+## 📂 Repository File Map
 
-This project uses ESP-IDF CMake. Use your normal ESP-IDF workflow in VS Code or the ESP-IDF CLI.
+```
+HydroponicsIDF/
+├── CMakeLists.txt                 # Project-level CMake build script
+├── sdkconfig.defaults             # ESP-IDF compile-time configuration overrides
+├── partitions.csv                 # 16MB custom flash partition table (Dual OTA)
+├── version.txt                    # Canonical project firmware release version string
+├── components/
+│   └── unity_tests/               # Embedded unit testing suite for safety logic
+│       ├── CMakeLists.txt
+│       └── test_runtime_safety.c  # Unity test cases for watchdogs and interlocks
+├── main/
+│   ├── CMakeLists.txt             # Component registration for main firmware
+│   ├── idf_component.yml          # Component manager dependencies (1-wire, ds18b20)
+│   ├── main.c                     # System entry point (app_main), early GPIO clamp
+│   ├── pin_config.h               # Hardware pin definitions & peripheral switches
+│   ├── safety_config.h            # Physical bounds, timeouts, and safety parameters
+│   ├── runtime_tasks.c/.h         # FreeRTOS task orchestration (Safety, Dosing, Sensor, Comm)
+│   ├── runtime_safety.c/.h        # Safety state machine, WDT evaluation, fault bits
+│   ├── actuator_control.c/.h      # GPIO output logic, pulse timers, and status publishers
+│   ├── sensor_telemetry.c/.h      # Multi-sensor acquisition, filtering, snapshot cache
+│   ├── sensor_calibration_nvs.c/.h# Dynamic 2-point slope/offset calibration engine
+│   ├── i2c_bus.c/.h               # Thread-safe I2C bus driver with mutex arbitration
+│   ├── ph_serial.c/.h             # Isolated UART1 serial pH sensor driver
+│   ├── sht31.c/.h                 # SHT31 ambient temperature, humidity, VPD calculations
+│   ├── lcd_status.c/.h            # 20x4 LCD driver with marquee scrolling task
+│   ├── mqtt_manager.c/.h          # MQTT client lifecycle, subscription router
+│   ├── wifi_manager.c/.h          # Wi-Fi AP/STA mode controller with auto-reconnect
+│   ├── web_portal.c/.h            # Captive HTTP configuration web server
+│   ├── ota_update.c/.h            # HTTP OTA background firmware flashing engine
+│   ├── setup_button.c/.h          # Hardware debounced setup button monitor
+│   ├── setup_config.c/.h          # NVS storage for Wi-Fi and MQTT broker configuration
+│   ├── zone_config.c/.h           # NVS storage for hydroponic zone metadata
+│   ├── indicator_led.c/.h         # Status and alarm LED blink engine
+│   └── syslog.c/.h                # UDP remote network logging driver
+└── README.md                      # Primary project documentation
+```
 
-## Where to modify for common changes
+---
 
-- New actuator channel:
-  - Add GPIO and name in pin_config.h and actuator_control.c/h.
-  - Update subscriptions in runtime_tasks.c.
-  - Update debug topic list in web_portal.c.
+## 📖 Documentation Vault & References
 
-- New telemetry sensor:
-  - Add sampling logic and topic name in sensor_telemetry.c/h.
-  - Publish it in comm_task in runtime_tasks.c.
+For comprehensive engineering specifications, circuit schematics, viva defense explanations, and PCB designs, consult the companion technical documentation:
 
-- Safety threshold changes:
-  - Edit safety_config.h and verify safety_task logic in runtime_tasks.c.
+- **[MQTT Protocol Reference](file:///c:/Users/ASUS/Documents/HydroponicsIDF/topics.md)**: Exhaustive topic listing and QoS specifications.
+- **[Task Documentation](file:///c:/Users/ASUS/Documents/HydroponicsIDF/task_safety.md)**: Deep dives into [`task_safety.md`](file:///c:/Users/ASUS/Documents/HydroponicsIDF/task_safety.md), [`task_dosing.md`](file:///c:/Users/ASUS/Documents/HydroponicsIDF/task_dosing.md), [`task_sensor.md`](file:///c:/Users/ASUS/Documents/HydroponicsIDF/task_sensor.md), and [`task_comm.md`](file:///c:/Users/ASUS/Documents/HydroponicsIDF/task_comm.md).
+- **[Architecture & Defense Guide](file:///c:/Users/ASUS/Documents/HydroponicsIDF/sidang.md)**: 60+ technical defense and architectural Q&A items.
+- **Obsidian Engineering Vault (`MaksTheResearcher/HydroponicsIDF`)**: Contains full Altium/KiCad PCB guides, 4-layer EMC layouts, IP65 enclosure specifications, and power tree topologies.
 
-- OTA behavior:
-  - Edit URL build and trigger handling in runtime_tasks.c.
-  - Edit HTTP OTA limits in ota_update.c.
+---
 
-- Portal fields:
-  - Update HTML and parsing in web_portal.c.
-  - Persist new values in setup_config.c.
+## 📄 License
+This project is licensed under the MIT License — see the LICENSE file for details.
